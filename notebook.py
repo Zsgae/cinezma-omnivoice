@@ -192,6 +192,222 @@ def generate_custom(text, language, ref_audio, ref_text, ns, gs, dn, sp, du, pp,
         mode="clone", ref_text=ref_text or None
     )
 
+
+# ── Forced Alignment (CTC) ────────────────────────────────────────────────────
+import json as _json
+import os, re, tempfile
+import numpy as np
+import soundfile as sf
+
+_ALIGNER_MODEL = None
+
+_TARGET_SR = 16000  # MMS_FA requires 16 kHz — mismatched SR is the #1 cause of bad timestamps
+
+
+def _resample_to_16k(data: np.ndarray, sr: int) -> np.ndarray:
+    """Resample audio to 16 kHz using linear interpolation (no extra deps)."""
+    if sr == _TARGET_SR:
+        return data
+    target_len = int(round(len(data) * _TARGET_SR / sr))
+    return np.interp(
+        np.linspace(0, len(data) - 1, target_len),
+        np.arange(len(data)),
+        data,
+    ).astype(np.float32)
+
+
+def _detect_silences(data: np.ndarray, sr: int,
+                     min_silence_sec: float = 0.15,
+                     rms_threshold: float = 0.01,
+                     frame_ms: int = 20) -> list:
+    """
+    Fast RMS-based silence detector.  Returns a list of
+    {"start": float, "end": float} dicts for every gap whose RMS
+    stays below rms_threshold for at least min_silence_sec.
+    """
+    frame_len = int(sr * frame_ms / 1000)
+    n_frames   = len(data) // frame_len
+    silences, in_silence, gap_start = [], False, 0.0
+
+    for i in range(n_frames):
+        chunk = data[i * frame_len: (i + 1) * frame_len]
+        rms   = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+        t     = i * frame_ms / 1000.0
+
+        if rms < rms_threshold:
+            if not in_silence:
+                in_silence, gap_start = True, t
+        else:
+            if in_silence:
+                in_silence = False
+                if t - gap_start >= min_silence_sec:
+                    silences.append({"start": round(gap_start, 3),
+                                     "end":   round(t, 3)})
+
+    if in_silence:
+        t_end = n_frames * frame_ms / 1000.0
+        if t_end - gap_start >= min_silence_sec:
+            silences.append({"start": round(gap_start, 3),
+                             "end":   round(t_end, 3)})
+    return silences
+
+
+def align_japanese(audio_path: str, japanese_text: str, translation_map_json: str = "") -> str:
+    """
+    CTC forced alignment — returns a JSON object with four keys cinEZma needs:
+
+      romaji_stamps  – list of {text, start, end} for every romaji word
+      jp_tokens      – original Japanese surface forms (for verification)
+      jp_counts      – "sticky note" list: jp_counts[i] = how many romaji
+                       words came from jp_tokens[i]. sum(jp_counts) always
+                       equals len(romaji_stamps) (verified before return).
+      silence_ranges – list of {start, end} silence gaps detected by RMS scan
+      errors         – null, or a short message if something went wrong
+    """
+    if not audio_path:
+        return _json.dumps({"error": "Missing audio file."}, ensure_ascii=False)
+    if not japanese_text or not japanese_text.strip():
+        return _json.dumps({
+            "error": "Missing Japanese Script. Forced alignment needs the exact text spoken in the audio."
+        }, ensure_ascii=False)
+
+    try:
+        from ctc_forced_aligner import get_word_stamps
+        import cutlet
+        import fugashi
+    except ImportError as e:
+        return _json.dumps({"error": f"Missing dependency: {e}"}, ensure_ascii=False)
+
+    try:
+        global _ALIGNER_MODEL
+
+        # ── Step 1-2: tokenize JP → romaji, track counts per JP token ──────
+        token_pairs, romaji_words = _tokenize_with_index(japanese_text, cutlet, fugashi)
+        if not romaji_words:
+            return _json.dumps({
+                "error": "Japanese Script produced no romanizable tokens."
+            }, ensure_ascii=False)
+
+        jp_tokens  = [jp  for jp,  _ in token_pairs]
+        jp_counts  = [cnt for _,  cnt in token_pairs]
+        romaji_transcript = " ".join(romaji_words)
+        print(f"[Align] JP tokens : {jp_tokens}")
+        print(f"[Align] jp_counts : {jp_counts}  (sum={sum(jp_counts)}, words={len(romaji_words)})")
+        print(f"[Align] Romaji    : {romaji_transcript}")
+
+        # ── Step 3: load + fix audio ────────────────────────────────────────
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_data, raw_sr = sf.read(audio_path)
+
+            # Collapse stereo → mono
+            if raw_data.ndim > 1:
+                raw_data = raw_data.mean(axis=1)
+
+            # CRITICAL: resample to exactly 16 kHz so timestamps are correct
+            audio_16k = _resample_to_16k(raw_data.astype(np.float32), raw_sr)
+
+            # Run silence detection on the 16 kHz mono signal
+            silence_ranges = _detect_silences(audio_16k, _TARGET_SR)
+            print(f"[Align] Silence gaps : {silence_ranges}")
+
+            wav_path = os.path.join(tmpdir, "input.wav")
+            sf.write(wav_path, audio_16k, _TARGET_SR)
+
+            transcript_path = os.path.join(tmpdir, "transcript.txt")
+            with open(transcript_path, "w", encoding="utf-8") as f:
+                f.write(romaji_transcript)
+
+            result = get_word_stamps(wav_path, transcript_path,
+                                     model=_ALIGNER_MODEL, model_type="MMS_FA")
+
+        if isinstance(result, tuple):
+            raw_stamps = result[0]
+            if len(result) > 1:
+                _ALIGNER_MODEL = result[1]
+        else:
+            raw_stamps = result
+
+        # ── Step 4: clean stamps ────────────────────────────────────────────
+        stamps = []
+        for wt in raw_stamps or []:
+            if not isinstance(wt, dict):
+                continue
+            text = wt.get("text") or wt.get("word") or wt.get("label") or ""
+            text = re.sub(r"[^A-Za-z']", " ", str(text))
+            text = re.sub(r"\s+", " ", text).strip().lower()
+            if not text:
+                continue
+            stamps.append({
+                "text":  text,
+                "start": round(float(wt.get("start", 0)), 3),
+                "end":   round(float(wt.get("end",   0)), 3),
+            })
+
+        if not stamps:
+            return _json.dumps({
+                "error": "Alignment returned no timestamps.",
+                "romaji_transcript": romaji_transcript,
+            }, ensure_ascii=False)
+
+        # ── Step 5: sanity check sum(jp_counts) == len(stamps) ─────────────
+        count_sum = sum(jp_counts)
+        count_ok  = count_sum == len(stamps)
+        errors    = None if count_ok else (
+            f"jp_counts sum ({count_sum}) != romaji stamp count ({len(stamps)}). "
+            "The app should fall back to raw stamps."
+        )
+        if errors:
+            print(f"[Align] WARNING: {errors}")
+
+        print(f"[Align] Romaji stamps : {stamps[:5]} ...")
+        return _json.dumps({
+            "romaji_stamps":  stamps,
+            "jp_tokens":      jp_tokens,
+            "jp_counts":      jp_counts,
+            "silence_ranges": silence_ranges,
+            "errors":         errors,
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        import traceback
+        return _json.dumps({
+            "error": f"Alignment failed: {e}",
+            "trace": traceback.format_exc()[-1200:],
+        }, ensure_ascii=False)
+
+
+def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
+    """
+    Tokenize Japanese into surface forms using fugashi/MeCab.
+    Romanize each token individually with cutlet, keeping the jp<->romaji index.
+
+    Returns:
+      token_pairs  -- [(jp_surface, romaji_word_count), ...]
+      romaji_words -- flat list of romaji words in the same order
+    """
+    tagger = fugashi_module.Tagger()
+    katsu  = cutlet_module.Cutlet()
+    token_pairs  = []
+    romaji_words = []
+
+    for word in tagger(text.strip()):
+        surface = word.surface
+        if not surface.strip():
+            continue
+        r = katsu.romaji(surface)
+        r = re.sub(r"[^A-Za-z']", " ", r)
+        r = re.sub(r"\s+", " ", r).strip().lower()
+        words = r.split()
+        if not words:
+            continue  # Punctuation / symbol token — skip
+        token_pairs.append((surface, len(words)))
+        romaji_words.extend(words)
+
+    return token_pairs, romaji_words
+
+
+
+
 with gr.Blocks(title="OmniVoice Demo") as demo:
     gr.HTML(BRAND_HTML)
 
@@ -290,6 +506,25 @@ with gr.Blocks(title="OmniVoice Demo") as demo:
                 design_fn,
                 inputs=[vd_text, vd_lang, vd_ns, vd_gs, vd_dn, vd_sp, vd_du, vd_pp, vd_po] + vd_groups,
                 outputs=[vd_audio, vd_status],
+            )
+        with gr.TabItem("MFA Align"):
+            with gr.Row():
+                with gr.Column():
+                    mfa_audio   = gr.Audio(label="Generated Audio", type="filepath")
+                    mfa_jp_text = gr.Textbox(label="Japanese Script", lines=4)
+                    mfa_map     = gr.Textbox(
+                        label="Translation Map JSON (optional)", lines=4, value="[]",
+                        placeholder="Leave as [] to test raw alignment; cinEZma fills this automatically.",
+                    )
+                    mfa_btn = gr.Button("Align", variant="primary", size="lg")
+                with gr.Column():
+                    mfa_output = gr.Textbox(label="Alignment JSON", lines=10)
+
+            mfa_btn.click(
+                align_japanese,
+                inputs=[mfa_audio, mfa_jp_text, mfa_map],
+                outputs=[mfa_output],
+                api_name="align_japanese",
             )
 
 # ── Launch Gradio + relay registration ───────────────────────────────────────
