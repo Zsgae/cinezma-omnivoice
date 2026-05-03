@@ -110,7 +110,7 @@ CSS = """
 .tag-hint { font-size:.8em; color:#888; margin-top:4px; }
 """
 
-with gr.Blocks(title='Fish S2 Pro — cinEZma', css=CSS) as demo:
+with gr.Blocks(title='Fish S2 Pro — cinEZma') as demo:
 
     gr.HTML("""
     <div style="text-align:center;padding:24px;background:linear-gradient(135deg,#667eea,#764ba2);
@@ -151,7 +151,7 @@ with gr.Blocks(title='Fish S2 Pro — cinEZma', css=CSS) as demo:
         top_p       = gr.Slider(0.1, 1.0, value=0.8, step=0.05, label='Top-p')
 
     gen_btn   = gr.Button('Generate ▶', variant='primary', elem_id='gen-btn')
-    audio_out = gr.Audio(label='Output Audio', type='filepath', show_download_button=True)
+    audio_out = gr.Audio(label='Output Audio', type='filepath')
 
     def refresh_voices():
         voices = get_voices()
@@ -171,6 +171,7 @@ _, _, share_url = demo.launch(
     share=True,
     quiet=True,
     prevent_thread_lock=True,
+    css=CSS,
 )
 
 print(f'[S2 Pro] Public URL: {share_url}')
