@@ -28,6 +28,7 @@ CHECKPOINT = "k2-fsa/OmniVoice"
 VOICES_DIR = "/kaggle/working/voice-assets/voices"
 
 print(f"Loading model from {CHECKPOINT} ...")
+os.environ["HF_HOME"] = "/kaggle/input/omnivoice-cache/.cache/huggingface"
 model = OmniVoice.from_pretrained(
     CHECKPOINT,
     device_map="cuda",
