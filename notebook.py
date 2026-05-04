@@ -563,4 +563,3 @@ demo.queue()
 # No prevent_thread_lock — launch() blocks here, keeping the cell alive.
 # share_url gets set by Gradio's tunnel thread within ~30s of blocking.
 demo.launch(share=True, debug=True, theme=gr.themes.Soft(), css=CSS)
-
