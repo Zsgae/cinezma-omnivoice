@@ -2,10 +2,10 @@
 """
 OmniVoice - cinEZma Edition
 Auto-pulled from GitHub by the Kaggle launcher notebook.
-Edit this file and push to GitHub â€” changes take effect on next Kaggle restart.
+Edit this file and push to GitHub — changes take effect on next Kaggle restart.
 """
 
-# â”€â”€ Model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Model ─────────────────────────────────────────────────────────────────────
 import glob
 import logging
 import os
@@ -45,7 +45,7 @@ print(f"Model loaded. Sampling rate: {sampling_rate} Hz")
 print(f"Preset voices found: {len(get_characters())}")
 
 
-# â”€â”€ Gradio UI + Relay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Gradio UI + Relay ─────────────────────────────────────────────────────────
 import gradio as gr
 import requests
 import time
@@ -102,8 +102,8 @@ CATEGORIES = {
                        "canadian accent", "indian accent", "chinese accent",
                        "japanese accent", "korean accent", "portuguese accent",
                        "russian accent"],
-    "Chinese Dialect": ["å››å·è¯", "é™•è¥¿è¯", "å¹¿ä¸œè¯", "ä¸œåŒ—è¯", "æ²³å—è¯",
-                        "äº‘å—è¯", "è´µå·žè¯", "æ¡‚æž—è¯", "æµŽå—è¯"],
+    "Chinese Dialect": ["四川话", "陕西话", "广东话", "东北话", "河南话",
+                        "云南话", "贵州话", "桂林话", "济南话"],
 }
 
 ATTR_INFO = {
@@ -193,7 +193,7 @@ def generate_custom(text, language, ref_audio, ref_text, ns, gs, dn, sp, du, pp,
     )
 
 
-# â”€â”€ Forced Alignment (CTC) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Forced Alignment (CTC) ────────────────────────────────────────────────────
 import json as _json
 import os, re, tempfile
 import numpy as np
@@ -201,7 +201,7 @@ import soundfile as sf
 
 _ALIGNER_MODEL = None
 
-_TARGET_SR = 16000  # MMS_FA requires 16 kHz â€” mismatched SR is the #1 cause of bad timestamps
+_TARGET_SR = 16000  # MMS_FA requires 16 kHz — mismatched SR is the #1 cause of bad timestamps
 
 
 def _resample_to_16k(data: np.ndarray, sr: int) -> np.ndarray:
@@ -241,28 +241,26 @@ def _detect_silences(data: np.ndarray, sr: int,
             if in_silence:
                 in_silence = False
                 if t - gap_start >= min_silence_sec:
-                    silences.append({"start": round(gap_start, 3),
-                                     "end":   round(t, 3)})
+                    silences.append([round(gap_start, 3), round(t, 3)])
 
     if in_silence:
         t_end = n_frames * frame_ms / 1000.0
         if t_end - gap_start >= min_silence_sec:
-            silences.append({"start": round(gap_start, 3),
-                             "end":   round(t_end, 3)})
+            silences.append([round(gap_start, 3), round(t_end, 3)])
     return silences
 
 
 def align_japanese(audio_path: str, japanese_text: str, translation_map_json: str = "") -> str:
     """
-    CTC forced alignment â€” returns a JSON object with four keys cinEZma needs:
+    CTC forced alignment — returns a JSON object with four keys cinEZma needs:
 
-      romaji_stamps  â€“ list of {text, start, end} for every romaji word
-      jp_tokens      â€“ original Japanese surface forms (for verification)
-      jp_counts      â€“ "sticky note" list: jp_counts[i] = how many romaji
+      romaji_stamps  – list of {text, start, end} for every romaji word
+      jp_tokens      – original Japanese surface forms (for verification)
+      jp_counts      – "sticky note" list: jp_counts[i] = how many romaji
                        words came from jp_tokens[i]. sum(jp_counts) always
                        equals len(romaji_stamps) (verified before return).
-      silence_ranges â€“ list of {start, end} silence gaps detected by RMS scan
-      errors         â€“ null, or a short message if something went wrong
+      silence_ranges – list of {start, end} silence gaps detected by RMS scan
+      errors         – null, or a short message if something went wrong
     """
     if not audio_path:
         return _json.dumps({"error": "Missing audio file."}, ensure_ascii=False)
@@ -281,7 +279,7 @@ def align_japanese(audio_path: str, japanese_text: str, translation_map_json: st
     try:
         global _ALIGNER_MODEL
 
-        # â”€â”€ Step 1-2: tokenize JP â†’ romaji, track counts per JP token â”€â”€â”€â”€â”€â”€
+        # ── Step 1-2: tokenize JP → romaji, track counts per JP token ──────
         token_pairs, romaji_words = _tokenize_with_index(japanese_text, cutlet, fugashi)
         if not romaji_words:
             return _json.dumps({
@@ -295,11 +293,11 @@ def align_japanese(audio_path: str, japanese_text: str, translation_map_json: st
         print(f"[Align] jp_counts : {jp_counts}  (sum={sum(jp_counts)}, words={len(romaji_words)})")
         print(f"[Align] Romaji    : {romaji_transcript}")
 
-        # â”€â”€ Step 3: load + fix audio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Step 3: load + fix audio ────────────────────────────────────────
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_data, raw_sr = sf.read(audio_path)
 
-            # Collapse stereo â†’ mono
+            # Collapse stereo → mono
             if raw_data.ndim > 1:
                 raw_data = raw_data.mean(axis=1)
 
@@ -327,7 +325,7 @@ def align_japanese(audio_path: str, japanese_text: str, translation_map_json: st
         else:
             raw_stamps = result
 
-        # â”€â”€ Step 4: clean stamps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Step 4: clean stamps ────────────────────────────────────────────
         stamps = []
         for wt in raw_stamps or []:
             if not isinstance(wt, dict):
@@ -338,7 +336,7 @@ def align_japanese(audio_path: str, japanese_text: str, translation_map_json: st
             if not text:
                 continue
             stamps.append({
-                "text":  text,
+                "word":  text,
                 "start": round(float(wt.get("start", 0)), 3),
                 "end":   round(float(wt.get("end",   0)), 3),
             })
@@ -349,7 +347,7 @@ def align_japanese(audio_path: str, japanese_text: str, translation_map_json: st
                 "romaji_transcript": romaji_transcript,
             }, ensure_ascii=False)
 
-        # â”€â”€ Step 5: sanity check sum(jp_counts) == len(stamps) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Step 5: sanity check sum(jp_counts) == len(stamps) ─────────────
         count_sum = sum(jp_counts)
         count_ok  = count_sum == len(stamps)
         errors    = None if count_ok else (
@@ -399,7 +397,7 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
         r = re.sub(r"\s+", " ", r).strip().lower()
         words = r.split()
         if not words:
-            continue  # Punctuation / symbol token â€” skip
+            continue  # Punctuation / symbol token — skip
         token_pairs.append((surface, len(words)))
         romaji_words.extend(words)
 
@@ -527,10 +525,10 @@ with gr.Blocks(title="OmniVoice Demo") as demo:
                 api_name="align_japanese",
             )
 
-# â”€â”€ Launch Gradio + relay registration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Launch Gradio + relay registration ───────────────────────────────────────
 # Key insight: demo.share_url IS set while server runs (confirmed).
 # We start a watcher thread first, then call launch() WITHOUT
-# prevent_thread_lock â€” launch() blocks the main thread, which is fine.
+# prevent_thread_lock — launch() blocks the main thread, which is fine.
 # The watcher thread sees share_url appear, registers, and exits.
 import threading, time
 
@@ -545,21 +543,21 @@ def _register():
                 try:
                     r = requests.post(RELAY_URL, json={"url": url}, timeout=15)
                     if r.status_code == 200:
-                        print(f"[Relay] âœ“ Registered (attempt {attempt})")
+                        print(f"[Relay] ✓ Registered (attempt {attempt})")
                         return
                     else:
                         print(f"[Relay] Attempt {attempt} HTTP {r.status_code}: {r.text}")
                 except Exception as e:
                     print(f"[Relay] Attempt {attempt} error: {e}")
                 time.sleep(3)
-            print(f"[Relay] âš  Failed. Paste manually: {url}")
+            print(f"[Relay] ⚠ Failed. Paste manually: {url}")
             return
         time.sleep(2)
-    print("[Relay] âš  share_url never appeared after 3 min.")
+    print("[Relay] ⚠ share_url never appeared after 3 min.")
 
 threading.Thread(target=_register, daemon=True).start()
 
 demo.queue()
-# No prevent_thread_lock â€” launch() blocks here, keeping the cell alive.
+# No prevent_thread_lock — launch() blocks here, keeping the cell alive.
 # share_url gets set by Gradio's tunnel thread within ~30s of blocking.
 demo.launch(share=True, debug=True, theme=gr.themes.Soft(), css=CSS)
