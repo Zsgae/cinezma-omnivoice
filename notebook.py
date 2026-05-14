@@ -264,6 +264,7 @@ def _install_codec_import_stubs():
     plus Fish's own encode/from_indices methods, so a tiny import stub is enough.
     """
     import importlib
+    import importlib.util
     import types
     import traceback
 
@@ -292,6 +293,39 @@ def _install_codec_import_stubs():
     for module_name in list(sys.modules):
         if module_name == "dac" or module_name.startswith("dac."):
             sys.modules.pop(module_name, None)
+
+    dac_root = None
+    for entry in sys.path:
+        candidate = Path(entry) / "dac"
+        if (candidate / "model" / "base.py").exists() and (candidate / "nn" / "layers.py").exists():
+            dac_root = candidate
+            break
+    if dac_root is None:
+        raise RuntimeError("Could not find descript-audio-codec package files on sys.path.")
+
+    def _make_package(name, path):
+        module = types.ModuleType(name)
+        module.__path__ = [str(path)]
+        sys.modules[name] = module
+        return module
+
+    def _load_module(name, path):
+        spec = importlib.util.spec_from_file_location(name, str(path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Could not load module spec for {name} from {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    dac_module = _make_package("dac", dac_root)
+    dac_model_module = _make_package("dac.model", dac_root / "model")
+    dac_nn_module = _make_package("dac.nn", dac_root / "nn")
+    dac_module.model = dac_model_module
+    dac_module.nn = dac_nn_module
+    dac_model_module.base = _load_module("dac.model.base", dac_root / "model" / "base.py")
+    dac_nn_module.layers = _load_module("dac.nn.layers", dac_root / "nn" / "layers.py")
+
     sys.modules.pop("fish_speech.models.dac.modded_dac", None)
     sys.modules.pop("fish_speech.models.dac.rvq", None)
     importlib.invalidate_caches()
