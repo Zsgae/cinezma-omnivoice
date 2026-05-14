@@ -122,23 +122,44 @@ def _ensure_fish_repo():
     )
 
 
+def _verify_fish_runtime_imports():
+    import importlib
+
+    importlib.invalidate_caches()
+    from fish_speech.models.text2semantic.inference import (  # noqa: F401
+        decode_to_audio,
+        encode_audio,
+        generate_long,
+        init_model,
+        load_codec_model,
+    )
+    import soundfile  # noqa: F401
+    import torchaudio  # noqa: F401
+
+
 def _ensure_fish_package():
     if str(FISH_ROOT) not in sys.path:
         sys.path.insert(0, str(FISH_ROOT))
     try:
-        import fish_speech  # noqa: F401
+        _verify_fish_runtime_imports()
 
         return
+    except ModuleNotFoundError as exc:
+        missing_dep = exc.name
+        if not FISH_AUTO_SETUP:
+            raise
+        print(f"[Fish Local] Missing Python dependency '{missing_dep}'. Installing Fish Speech package deps ...")
     except Exception:
         if not FISH_AUTO_SETUP:
             raise
+        print("[Fish Local] Fish Speech runtime import failed. Installing Fish Speech package deps ...")
 
     install_target = os.environ.get("FISH_PIP_TARGET", ".")
     _run_cmd([sys.executable, "-m", "pip", "install", "-e", install_target], cwd=FISH_ROOT, timeout=None)
 
     if str(FISH_ROOT) not in sys.path:
         sys.path.insert(0, str(FISH_ROOT))
-    import fish_speech  # noqa: F401
+    _verify_fish_runtime_imports()
 
 
 def _ensure_system_deps():
