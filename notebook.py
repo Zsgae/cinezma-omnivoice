@@ -37,6 +37,8 @@ VOICES_DIR = "/kaggle/working/voice-assets/voices"
 OUTPUT_DIR = Path(os.environ.get("FISH_OUTPUT_DIR", "/kaggle/working/fish-audio-output"))
 FISH_DEVICE = os.environ.get("FISH_DEVICE", "cuda")
 FISH_CODEC_DEVICE = os.environ.get("FISH_CODEC_DEVICE", "cpu")
+# NOTE: set FISH_CODEC_DEVICE=cuda to run the codec on GPU for much faster decode.
+# CPU is the safe default (avoids VRAM pressure) but adds ~2-4x latency on long clips.
 FISH_TOP_K = int(os.environ.get("FISH_TOP_K", "30"))
 FISH_SEED = int(os.environ.get("FISH_SEED", "42"))
 
@@ -234,9 +236,14 @@ def _ensure_system_deps():
 
 
 def _ensure_fish_weights():
-    model_path = FISH_CHECKPOINT_DIR / "model.pth"
-    codec_path = FISH_CHECKPOINT_DIR / "codec.pth"
-    if model_path.exists() and codec_path.exists():
+    # s2-pro uses sharded safetensors — there is no model.pth.
+    # We consider weights present if the checkpoint dir exists, contains a
+    # config.json (always present after a complete snapshot_download), and has
+    # at least one .safetensors shard.  Checking codec.pth separately would
+    # re-download on every boot since s2-pro may name the codec differently.
+    config_path = FISH_CHECKPOINT_DIR / "config.json"
+    has_shards = bool(list(FISH_CHECKPOINT_DIR.glob("*.safetensors"))) if FISH_CHECKPOINT_DIR.exists() else False
+    if config_path.exists() and has_shards:
         return
     if not FISH_AUTO_SETUP:
         raise RuntimeError(f"Fish S2 Pro weights missing at {FISH_CHECKPOINT_DIR}.")
@@ -258,10 +265,18 @@ def _ensure_fish_weights():
 
 def _install_codec_import_stubs():
     """
-    Fish's DAC module imports audiotools for training/export helpers. Kaggle's
-    torchaudio wheel often fails to load, which breaks audiotools import before
-    the codec can be instantiated. Local inference only needs nn.Module behavior
-    plus Fish's own encode/from_indices methods, so a tiny import stub is enough.
+    Fish's DAC codec imports audiotools for training/export helpers that are not
+    needed for inference.  We stub out the entire audiotools namespace and manually
+    load only the two DAC submodules Fish actually needs: dac.model.base and
+    dac.nn.layers.  This avoids the STFTParams / audiotools.data crash while
+    keeping dac.model.base's real nn.Module definitions intact.
+
+    Stub coverage:
+      audiotools                – AudioSignal, STFTParams
+      audiotools.ml             – BaseModel (nn.Module subclass), Accelerator
+      audiotools.core           – empty package (dac.model.base may import from here)
+      audiotools.data           – empty package + data.audio sub-stub
+      audiotools.ml.decorators  – empty (used by BaseModel class body in some versions)
     """
     import importlib
     import importlib.util
@@ -273,6 +288,9 @@ def _install_codec_import_stubs():
     class _AudioSignalStub:
         pass
 
+    class _STFTParamsStub:
+        pass
+
     class _BaseModelStub(torch.nn.Module):
         INTERN = []
         EXTERN = []
@@ -280,16 +298,36 @@ def _install_codec_import_stubs():
     class _AcceleratorStub:
         pass
 
-    audiotools_module = types.ModuleType("audiotools")
-    audiotools_module.AudioSignal = _AudioSignalStub
+    def _make_stub(name, parent=None, **attrs):
+        m = types.ModuleType(name)
+        m.__path__ = []          # make it look like a package
+        for k, v in attrs.items():
+            setattr(m, k, v)
+        sys.modules[name] = m
+        if parent is not None:
+            setattr(parent, name.split(".")[-1], m)
+        return m
 
-    audiotools_ml_module = types.ModuleType("audiotools.ml")
-    audiotools_ml_module.BaseModel = _BaseModelStub
-    audiotools_ml_module.Accelerator = _AcceleratorStub
-    audiotools_module.ml = audiotools_ml_module
+    # Root audiotools stub
+    at = _make_stub("audiotools",
+                    AudioSignal=_AudioSignalStub,
+                    STFTParams=_STFTParamsStub)
 
-    sys.modules["audiotools"] = audiotools_module
-    sys.modules["audiotools.ml"] = audiotools_ml_module
+    # audiotools.ml
+    at_ml = _make_stub("audiotools.ml", parent=at,
+                       BaseModel=_BaseModelStub,
+                       Accelerator=_AcceleratorStub)
+    _make_stub("audiotools.ml.decorators", parent=at_ml)
+
+    # audiotools.core  (dac.model.base may do `from audiotools.core import ...`)
+    at_core = _make_stub("audiotools.core", parent=at)
+
+    # audiotools.data  (some DAC versions: `from audiotools.data.audio import AudioSignal`)
+    at_data = _make_stub("audiotools.data", parent=at)
+    at_data_audio = _make_stub("audiotools.data.audio", parent=at_data,
+                               AudioSignal=_AudioSignalStub)
+
+    # Flush any previously imported dac modules so our manual load is clean
     for module_name in list(sys.modules):
         if module_name == "dac" or module_name.startswith("dac."):
             sys.modules.pop(module_name, None)
@@ -433,9 +471,14 @@ def _prepare_reference(audio_path, ref_text, lang_code):
     if not transcript:
         transcript = _load_sidecar_transcript(audio_path)
         transcript_source = "sidecar transcript"
-    if not transcript:
+    if not transcript and FISH_LOCAL_ASR:
         transcript = _transcribe_reference_audio(audio_path, lang_code)
         transcript_source = "local Whisper transcript"
+    if not transcript:
+        # S2 Pro can clone from audio tokens alone — prompt_text is optional.
+        # Log a heads-up but don't crash; generation will still work.
+        print("[Fish Local] No reference transcript found — cloning from audio only (prompt_text=None).")
+        return None, None
 
     return transcript, transcript_source
 
