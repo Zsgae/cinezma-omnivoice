@@ -8,15 +8,16 @@ Edit this file and push to GitHub; changes take effect on next Kaggle restart.
 # ── Model ─────────────────────────────────────────────────────────────────────
 import glob
 import logging
-import mimetypes
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import time
 import wave
 
 import numpy as np
-import requests
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -24,42 +25,40 @@ logging.basicConfig(
 )
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-FISH_MODEL = os.environ.get("FISH_MODEL") or os.environ.get("FISH_AUDIO_MODEL") or "s2-pro"
-FISH_TTS_URL = os.environ.get("FISH_TTS_URL", "https://api.fish.audio/v1/tts")
-FISH_ASR_URL = os.environ.get("FISH_ASR_URL", "https://api.fish.audio/v1/asr")
-FISH_TIMEOUT = int(os.environ.get("FISH_TIMEOUT", "180"))
-FISH_SAMPLE_RATE = int(os.environ.get("FISH_SAMPLE_RATE", "44100"))
-FISH_FORMAT = "wav"
-FISH_LATENCY = os.environ.get("FISH_LATENCY", "normal")
-FISH_DEFAULT_REFERENCE_ID = os.environ.get("FISH_REFERENCE_ID", "").strip()
-
+FISH_MODEL = os.environ.get("FISH_MODEL") or "fishaudio/s2-pro"
+FISH_REPO_URL = os.environ.get("FISH_REPO_URL", "https://github.com/fishaudio/fish-speech.git")
+FISH_REPO_REF = os.environ.get("FISH_REPO_REF", "main")
+FISH_ROOT = Path(os.environ.get("FISH_ROOT", "/kaggle/working/fish-speech"))
+FISH_CHECKPOINT_DIR = Path(
+    os.environ.get("FISH_CHECKPOINT_DIR", str(FISH_ROOT / "checkpoints" / "s2-pro"))
+)
 VOICES_DIR = "/kaggle/working/voice-assets/voices"
-OUTPUT_DIR = os.environ.get("FISH_OUTPUT_DIR", "/kaggle/working/fish-audio-output")
+OUTPUT_DIR = Path(os.environ.get("FISH_OUTPUT_DIR", "/kaggle/working/fish-audio-output"))
+FISH_DEVICE = os.environ.get("FISH_DEVICE", "cuda")
+FISH_CODEC_DEVICE = os.environ.get("FISH_CODEC_DEVICE", "cpu")
+FISH_TOP_K = int(os.environ.get("FISH_TOP_K", "30"))
+FISH_SEED = int(os.environ.get("FISH_SEED", "42"))
 
-_API_KEY_NAMES = ("FISH_API_KEY", "FISH_AUDIO_API_KEY")
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
-def _get_fish_api_key():
-    for name in _API_KEY_NAMES:
-        value = os.environ.get(name)
-        if value and value.strip():
-            return value.strip()
+FISH_AUTO_SETUP = _env_flag("FISH_AUTO_SETUP", True)
+FISH_APT_SETUP = _env_flag("FISH_APT_SETUP", True)
+FISH_HALF = _env_flag("FISH_HALF", True)
+FISH_COMPILE = _env_flag("FISH_COMPILE", False)
+FISH_LOCAL_ASR = _env_flag("FISH_LOCAL_ASR", False)
+FISH_LOCAL_ASR_MODEL = os.environ.get("FISH_LOCAL_ASR_MODEL", "small")
 
-    try:
-        from kaggle_secrets import UserSecretsClient
-
-        secrets = UserSecretsClient()
-        for name in _API_KEY_NAMES:
-            try:
-                value = secrets.get_secret(name)
-            except Exception:
-                value = None
-            if value and value.strip():
-                return value.strip()
-    except Exception:
-        pass
-
-    return ""
+_FISH_READY = False
+_TEXT_MODEL = None
+_DECODE_ONE_TOKEN = None
+_CODEC_MODEL = None
+_MODEL_LOAD_SECONDS = None
 
 
 def _language_code(language):
@@ -80,89 +79,172 @@ def _clamp_int(value, default, minimum, maximum):
     return int(round(_clamp_float(value, default, minimum, maximum)))
 
 
-def _pack_msgpack(payload):
+def _run_cmd(cmd, cwd=None, timeout=None):
+    printable = " ".join(str(part) for part in cmd)
+    print(f"[Fish Local] {printable}")
+    result = subprocess.run(
+        [str(part) for part in cmd],
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        tail = (result.stdout or "")[-4000:]
+        raise RuntimeError(f"Command failed ({result.returncode}): {printable}\n{tail}")
+    if result.stdout:
+        print(result.stdout[-1200:])
+    return result.stdout or ""
+
+
+def _ensure_fish_repo():
+    if (FISH_ROOT / "fish_speech").exists():
+        return
+    if not FISH_AUTO_SETUP:
+        raise RuntimeError(f"Fish Speech repo not found at {FISH_ROOT}.")
+    if not shutil.which("git"):
+        raise RuntimeError("git is required to clone fish-speech into Kaggle working storage.")
+
+    FISH_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    _run_cmd(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            FISH_REPO_REF,
+            FISH_REPO_URL,
+            str(FISH_ROOT),
+        ],
+        timeout=None,
+    )
+
+
+def _ensure_fish_package():
+    if str(FISH_ROOT) not in sys.path:
+        sys.path.insert(0, str(FISH_ROOT))
     try:
-        import ormsgpack
+        import fish_speech  # noqa: F401
 
-        return ormsgpack.packb(payload)
-    except ImportError:
-        try:
-            import msgpack
-
-            return msgpack.packb(payload, use_bin_type=True)
-        except ImportError as exc:
-            raise RuntimeError(
-                "Reference-audio cloning needs MessagePack. In Kaggle, install one "
-                "of these before launching: pip install ormsgpack"
-            ) from exc
-
-
-def _fish_error(response):
-    try:
-        body = response.json()
-        detail = body.get("message") or body.get("detail") or body
+        return
     except Exception:
-        detail = response.text[:1000]
-    return f"Fish Audio API {response.status_code}: {detail}"
+        if not FISH_AUTO_SETUP:
+            raise
+
+    install_target = os.environ.get("FISH_PIP_TARGET", ".")
+    _run_cmd([sys.executable, "-m", "pip", "install", "-e", install_target], cwd=FISH_ROOT, timeout=None)
+
+    if str(FISH_ROOT) not in sys.path:
+        sys.path.insert(0, str(FISH_ROOT))
+    import fish_speech  # noqa: F401
 
 
-def _fish_headers(api_key, content_type):
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": content_type,
-        "model": FISH_MODEL,
-    }
+def _ensure_system_deps():
+    if not FISH_AUTO_SETUP or not FISH_APT_SETUP or not shutil.which("apt-get"):
+        return
+    marker = Path("/kaggle/working/.fish_speech_system_deps_ok")
+    if marker.exists():
+        return
+    _run_cmd(["apt-get", "update"], timeout=None)
+    _run_cmd(["apt-get", "install", "-y", "portaudio19-dev", "libsox-dev", "ffmpeg"], timeout=None)
+    try:
+        marker.touch()
+    except OSError:
+        pass
 
 
-def _post_fish_tts(payload, api_key, needs_msgpack):
-    if needs_msgpack:
-        response = requests.post(
-            FISH_TTS_URL,
-            data=_pack_msgpack(payload),
-            headers=_fish_headers(api_key, "application/msgpack"),
-            timeout=FISH_TIMEOUT,
+def _ensure_fish_weights():
+    model_path = FISH_CHECKPOINT_DIR / "model.pth"
+    codec_path = FISH_CHECKPOINT_DIR / "codec.pth"
+    if model_path.exists() and codec_path.exists():
+        return
+    if not FISH_AUTO_SETUP:
+        raise RuntimeError(f"Fish S2 Pro weights missing at {FISH_CHECKPOINT_DIR}.")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        _run_cmd([sys.executable, "-m", "pip", "install", "huggingface_hub"], timeout=None)
+        from huggingface_hub import snapshot_download
+
+    FISH_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[Fish Local] Downloading {FISH_MODEL} to {FISH_CHECKPOINT_DIR} ...")
+    snapshot_download(
+        repo_id=FISH_MODEL,
+        local_dir=str(FISH_CHECKPOINT_DIR),
+        local_dir_use_symlinks=False,
+    )
+
+
+def _ensure_local_fish_ready():
+    global _FISH_READY
+    if _FISH_READY:
+        return
+    _ensure_fish_repo()
+    _ensure_system_deps()
+    _ensure_fish_package()
+    _ensure_fish_weights()
+    _FISH_READY = True
+
+
+def _load_local_models():
+    global _TEXT_MODEL, _DECODE_ONE_TOKEN, _CODEC_MODEL, _MODEL_LOAD_SECONDS
+    _ensure_local_fish_ready()
+    if _TEXT_MODEL is not None and _CODEC_MODEL is not None:
+        return
+
+    import torch
+    from fish_speech.models.text2semantic.inference import init_model, load_codec_model
+
+    if FISH_DEVICE == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("FISH_DEVICE is cuda, but CUDA is not available in this Kaggle session.")
+
+    precision = torch.half if FISH_HALF else torch.bfloat16
+    codec_precision = torch.float32 if FISH_CODEC_DEVICE == "cpu" else precision
+    start = time.time()
+    print(f"[Fish Local] Loading {FISH_MODEL} from {FISH_CHECKPOINT_DIR} on {FISH_DEVICE} ...")
+    _TEXT_MODEL, _DECODE_ONE_TOKEN = init_model(
+        FISH_CHECKPOINT_DIR,
+        FISH_DEVICE,
+        precision,
+        compile=FISH_COMPILE,
+    )
+    with torch.device(FISH_DEVICE):
+        _TEXT_MODEL.setup_caches(
+            max_batch_size=1,
+            max_seq_len=_TEXT_MODEL.config.max_seq_len,
+            dtype=next(_TEXT_MODEL.parameters()).dtype,
         )
-    else:
-        response = requests.post(
-            FISH_TTS_URL,
-            json=payload,
-            headers=_fish_headers(api_key, "application/json"),
-            timeout=FISH_TIMEOUT,
+    _CODEC_MODEL = load_codec_model(FISH_CHECKPOINT_DIR / "codec.pth", FISH_CODEC_DEVICE, codec_precision)
+    _MODEL_LOAD_SECONDS = time.time() - start
+    print(f"[Fish Local] Models loaded in {_MODEL_LOAD_SECONDS:.1f}s.")
+
+
+def _transcribe_reference_audio(audio_path, lang_code=None):
+    if not FISH_LOCAL_ASR:
+        raise RuntimeError(
+            "Local Fish S2 cloning needs the reference transcript. Type it in, "
+            "or place a .txt/.lab sidecar next to the reference wav. To try local "
+            "Whisper auto-transcription, set FISH_LOCAL_ASR=1 before launch."
         )
 
-    if not response.ok:
-        raise RuntimeError(_fish_error(response))
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type:
-        raise RuntimeError(f"Fish Audio API returned JSON instead of audio: {response.text[:1000]}")
-    return response.content
+    try:
+        from faster_whisper import WhisperModel
+    except Exception:
+        if not FISH_AUTO_SETUP:
+            raise
+        _run_cmd([sys.executable, "-m", "pip", "install", "faster-whisper"], timeout=None)
+        from faster_whisper import WhisperModel
 
-
-def _guess_audio_mime(audio_path):
-    guessed, _ = mimetypes.guess_type(audio_path)
-    return guessed or "audio/wav"
-
-
-def _transcribe_reference_audio(audio_path, lang_code, api_key):
-    data = {"ignore_timestamps": "true"}
-    if lang_code:
-        data["language"] = lang_code
-
-    with open(audio_path, "rb") as audio_file:
-        response = requests.post(
-            FISH_ASR_URL,
-            headers={"Authorization": f"Bearer {api_key}"},
-            data=data,
-            files={"audio": (Path(audio_path).name, audio_file, _guess_audio_mime(audio_path))},
-            timeout=FISH_TIMEOUT,
-        )
-
-    if not response.ok:
-        raise RuntimeError(_fish_error(response))
-
-    transcript = response.json().get("text", "").strip()
+    device = os.environ.get("FISH_LOCAL_ASR_DEVICE", "cpu")
+    compute_type = os.environ.get("FISH_LOCAL_ASR_COMPUTE_TYPE", "int8" if device == "cpu" else "float16")
+    model = WhisperModel(FISH_LOCAL_ASR_MODEL, device=device, compute_type=compute_type)
+    segments, _ = model.transcribe(audio_path, language=lang_code if lang_code else None, beam_size=5)
+    transcript = " ".join(segment.text.strip() for segment in segments).strip()
     if not transcript:
-        raise RuntimeError("Fish ASR returned an empty transcript. Please type the reference text.")
+        raise RuntimeError("Local Whisper returned an empty transcript. Please type the reference text.")
     return transcript
 
 
@@ -177,7 +259,7 @@ def _load_sidecar_transcript(audio_path):
     return ""
 
 
-def _prepare_reference(audio_path, ref_text, lang_code, api_key):
+def _prepare_reference(audio_path, ref_text, lang_code):
     if not audio_path:
         raise RuntimeError("Please provide a reference audio.")
     if not os.path.exists(audio_path):
@@ -189,13 +271,10 @@ def _prepare_reference(audio_path, ref_text, lang_code, api_key):
         transcript = _load_sidecar_transcript(audio_path)
         transcript_source = "sidecar transcript"
     if not transcript:
-        transcript = _transcribe_reference_audio(audio_path, lang_code, api_key)
-        transcript_source = "Fish ASR transcript"
+        transcript = _transcribe_reference_audio(audio_path, lang_code)
+        transcript_source = "local Whisper transcript"
 
-    with open(audio_path, "rb") as audio_file:
-        audio_bytes = audio_file.read()
-
-    return [{"audio": audio_bytes, "text": transcript}], transcript_source
+    return transcript, transcript_source
 
 
 def _apply_design_tag(text, instruct):
@@ -204,17 +283,22 @@ def _apply_design_tag(text, instruct):
     return text.strip()
 
 
-def _write_audio_file(audio_bytes):
-    out_dir = OUTPUT_DIR
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except OSError:
-        out_dir = tempfile.gettempdir()
+def _apply_speed_hint(text, speed):
+    speed = _clamp_float(speed, 1.0, 0.5, 2.0)
+    if speed >= 1.15:
+        return f"[speaking quickly] {text}"
+    if speed <= 0.85:
+        return f"[speaking slowly] {text}"
+    return text
 
-    out_path = os.path.join(out_dir, f"fish_s2_pro_{int(time.time() * 1000)}.wav")
-    with open(out_path, "wb") as output:
-        output.write(audio_bytes)
-    return out_path
+
+def _new_output_path():
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out_dir = OUTPUT_DIR
+    except OSError:
+        out_dir = Path(tempfile.gettempdir())
+    return str(out_dir / f"fish_s2_pro_{int(time.time() * 1000)}.wav")
 
 
 def _wav_duration(audio_path):
@@ -224,19 +308,22 @@ def _wav_duration(audio_path):
             duration = wav_file.getnframes() / float(sr)
         return duration, sr
     except Exception:
-        return None, FISH_SAMPLE_RATE
+        return None, 44100
 
 def get_characters():
     wavs = glob.glob(os.path.join(VOICES_DIR, "*.wav"))
     return {Path(w).stem: w for w in sorted(wavs)}
 
-print(f"Fish Audio model configured: {FISH_MODEL}")
-print(f"Fish Audio TTS endpoint: {FISH_TTS_URL}")
+print(f"Fish Speech local model configured: {FISH_MODEL}")
+print(f"Fish Speech repo path: {FISH_ROOT}")
+print(f"Fish Speech checkpoint path: {FISH_CHECKPOINT_DIR}")
+print(f"Fish Speech devices: model={FISH_DEVICE}, codec={FISH_CODEC_DEVICE}")
 print(f"Preset voices found: {len(get_characters())}")
 
 
 # ── Gradio UI + Relay ─────────────────────────────────────────────────────────
 import gradio as gr
+import requests
 
 RELAY_URL = os.environ.get(
     "FISH_RELAY_URL",
@@ -256,9 +343,9 @@ button.primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !
 
 BRAND_HTML = """
 <div class="brand-header">
-  <div class="brand-title">Fish Audio S2 Pro Demo</div>
+  <div class="brand-title">Fish Speech S2 Pro Local</div>
   <div class="brand-subtitle">cinEZma Edition</div>
-  <div class="hint">Preset character voices + custom clone + S2 inline control + relay auto-connect</div>
+  <div class="hint">Kaggle GPU generation + preset voices + custom clone + S2 inline control</div>
 </div>
 """
 
@@ -281,7 +368,7 @@ def gen_settings():
         sp = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed")
         du = gr.Slider(256, 4096, value=1024, step=64, label="Max New Tokens")
         pp = gr.Checkbox(value=True, label="Normalize Text")
-        po = gr.Checkbox(value=True, label="Condition On Previous Chunks")
+        po = gr.Checkbox(value=True, label="Iterative Prompt")
     return ns, gs, dn, sp, du, pp, po
 
 CATEGORIES = {
@@ -325,53 +412,71 @@ def generate_speech(text, language, ref_audio, instruct,
         return None, "Please enter some text."
 
     try:
-        api_key = _get_fish_api_key()
-        if not api_key:
-            return None, "Missing FISH_API_KEY. Add it as a Kaggle secret or environment variable."
+        _load_local_models()
+        import soundfile as sf
+        import torch
+        from fish_speech.models.text2semantic.inference import (
+            decode_to_audio,
+            encode_audio,
+            generate_long,
+        )
 
         lang_code = _language_code(language)
-        payload = {
-            "text": _apply_design_tag(text, instruct if mode == "design" else None),
-            "format": FISH_FORMAT,
-            "sample_rate": FISH_SAMPLE_RATE,
-            "temperature": _clamp_float(temperature, 0.7, 0.0, 1.0),
-            "top_p": _clamp_float(top_p, 0.7, 0.0, 1.0),
-            "chunk_length": _clamp_int(chunk_length, 200, 100, 300),
-            "max_new_tokens": _clamp_int(max_new_tokens, 1024, 256, 4096),
-            "normalize": bool(normalize_text),
-            "condition_on_previous_chunks": bool(condition_on_previous_chunks),
-            "latency": FISH_LATENCY,
-            "prosody": {
-                "speed": _clamp_float(speed, 1.0, 0.5, 2.0),
-                "volume": 0,
-                "normalize_loudness": True,
-            },
-        }
-
+        prompt_text = None
+        prompt_tokens = None
         transcript_source = None
-        needs_msgpack = False
+        clean_text = _apply_design_tag(text, instruct if mode == "design" else None)
+        clean_text = _apply_speed_hint(clean_text, speed)
 
         if mode == "clone":
-            payload["references"], transcript_source = _prepare_reference(
+            prompt_text, transcript_source = _prepare_reference(
                 ref_audio,
                 ref_text,
                 lang_code,
-                api_key,
             )
-            needs_msgpack = True
-        elif FISH_DEFAULT_REFERENCE_ID:
-            payload["reference_id"] = FISH_DEFAULT_REFERENCE_ID
+            prompt_tokens = [encode_audio(ref_audio, _CODEC_MODEL, FISH_CODEC_DEVICE).cpu()]
 
-        audio_bytes = _post_fish_tts(payload, api_key, needs_msgpack)
-        audio_path = _write_audio_file(audio_bytes)
+        torch.manual_seed(FISH_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(FISH_SEED)
+
+        generator = generate_long(
+            model=_TEXT_MODEL,
+            device=FISH_DEVICE,
+            decode_one_token=_DECODE_ONE_TOKEN,
+            text=clean_text.strip(),
+            num_samples=1,
+            max_new_tokens=_clamp_int(max_new_tokens, 1024, 0, 4096),
+            top_p=_clamp_float(top_p, 0.7, 0.01, 1.0),
+            top_k=FISH_TOP_K,
+            temperature=_clamp_float(temperature, 0.7, 0.01, 1.99),
+            compile=FISH_COMPILE,
+            iterative_prompt=bool(condition_on_previous_chunks),
+            chunk_length=_clamp_int(chunk_length, 300, 100, 300),
+            prompt_text=[prompt_text] if prompt_text else None,
+            prompt_tokens=prompt_tokens,
+        )
+
+        codes = []
+        for response in generator:
+            if response.action == "sample":
+                codes.append(response.codes)
+
+        if not codes:
+            return None, "Fish S2 Pro returned no audio codes."
+
+        merged_codes = torch.cat(codes, dim=1).to(FISH_CODEC_DEVICE)
+        audio = decode_to_audio(merged_codes, _CODEC_MODEL)
+        audio_path = _new_output_path()
+        sf.write(audio_path, audio.cpu().float().numpy(), _CODEC_MODEL.sample_rate)
         duration_seconds, sr = _wav_duration(audio_path)
     except Exception as e:
         return None, f"Error: {type(e).__name__}: {e}"
 
     if duration_seconds is None:
-        status = f"Generated audio with Fish Audio {FISH_MODEL}."
+        status = f"Generated audio locally with Fish Speech {FISH_MODEL}."
     else:
-        status = f"Generated {duration_seconds:.1f}s audio with Fish Audio {FISH_MODEL} at {sr}Hz."
+        status = f"Generated {duration_seconds:.1f}s locally with Fish Speech {FISH_MODEL} at {sr}Hz."
     if transcript_source:
         status += f" Reference used: {transcript_source}."
     return audio_path, status
@@ -608,7 +713,7 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
 
 
 
-with gr.Blocks(title="Fish Audio S2 Pro Demo") as demo:
+with gr.Blocks(title="Fish Speech S2 Pro Local") as demo:
     gr.HTML(BRAND_HTML)
 
     with gr.Tabs():
@@ -632,7 +737,7 @@ with gr.Blocks(title="Fish Audio S2 Pro Demo") as demo:
                     pv_ref_text = gr.Textbox(
                         label="Reference Text (optional)",
                         lines=2,
-                        placeholder="Transcript of the preset clip. Leave blank to use sidecar text or Fish ASR.",
+                        placeholder="Transcript of the preset clip. Blank uses .txt/.lab sidecar or local Whisper if enabled.",
                     )
                     pv_lang = lang_dropdown()
                     pv_ns, pv_gs, pv_dn, pv_sp, pv_du, pv_pp, pv_po = gen_settings()
@@ -664,7 +769,7 @@ with gr.Blocks(title="Fish Audio S2 Pro Demo") as demo:
                     vc_ref_text = gr.Textbox(
                         label="Reference Text (optional)",
                         lines=2,
-                        placeholder="Transcript of ref audio. Leave blank to use Fish ASR.",
+                        placeholder="Transcript of ref audio. Blank uses local Whisper only if FISH_LOCAL_ASR=1.",
                     )
                     vc_lang = lang_dropdown()
                     vc_ns, vc_gs, vc_dn, vc_sp, vc_du, vc_pp, vc_po = gen_settings()
