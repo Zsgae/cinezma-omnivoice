@@ -24,6 +24,7 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s: %(message)s",
 )
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+os.environ.setdefault("HYDRA_FULL_ERROR", "1")
 
 FISH_MODEL = os.environ.get("FISH_MODEL") or "fishaudio/s2-pro"
 FISH_REPO_URL = os.environ.get("FISH_REPO_URL", "https://github.com/fishaudio/fish-speech.git")
@@ -98,6 +99,62 @@ def _run_cmd(cmd, cwd=None, timeout=None):
     return result.stdout or ""
 
 
+def _metadata_version(package_name):
+    try:
+        from importlib import metadata
+
+        return metadata.version(package_name)
+    except Exception:
+        return None
+
+
+def _parse_version(version):
+    try:
+        from packaging.version import Version
+
+        return Version(version)
+    except Exception:
+        return None
+
+
+def _ensure_fish_runtime_versions():
+    if not FISH_AUTO_SETUP:
+        return
+
+    needs_fix = []
+    transformers_version = _metadata_version("transformers")
+    protobuf_version = _metadata_version("protobuf")
+
+    parsed_transformers = _parse_version(transformers_version) if transformers_version else None
+    parsed_protobuf = _parse_version(protobuf_version) if protobuf_version else None
+
+    if parsed_transformers is None or parsed_transformers > _parse_version("4.57.3"):
+        needs_fix.append(f"transformers={transformers_version or 'missing'}")
+    if (
+        parsed_protobuf is None
+        or parsed_protobuf < _parse_version("3.20.0")
+        or parsed_protobuf >= _parse_version("6.0.0")
+    ):
+        needs_fix.append(f"protobuf={protobuf_version or 'missing'}")
+
+    if not needs_fix:
+        return
+
+    print(f"[Fish Local] Repairing Fish runtime versions: {', '.join(needs_fix)}")
+    _run_cmd(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "transformers==4.57.3",
+            "protobuf==5.29.5",
+        ],
+        timeout=None,
+    )
+
+
 def _ensure_fish_repo():
     if (FISH_ROOT / "fish_speech").exists():
         return
@@ -138,6 +195,7 @@ def _verify_fish_runtime_imports():
 def _ensure_fish_package():
     if str(FISH_ROOT) not in sys.path:
         sys.path.insert(0, str(FISH_ROOT))
+    _ensure_fish_runtime_versions()
     try:
         _verify_fish_runtime_imports()
 
@@ -157,6 +215,7 @@ def _ensure_fish_package():
 
     if str(FISH_ROOT) not in sys.path:
         sys.path.insert(0, str(FISH_ROOT))
+    _ensure_fish_runtime_versions()
     _verify_fish_runtime_imports()
 
 
@@ -195,6 +254,37 @@ def _ensure_fish_weights():
         local_dir=str(FISH_CHECKPOINT_DIR),
         local_dir_use_symlinks=False,
     )
+
+
+def _install_codec_import_stubs():
+    """
+    Fish's DAC module imports audiotools for training/export helpers. Kaggle's
+    torchaudio wheel often fails to load, which breaks audiotools import before
+    the codec can be instantiated. Local inference only needs nn.Module behavior
+    plus Fish's own encode/from_indices methods, so a tiny import stub is enough.
+    """
+    import importlib
+    import types
+
+    import torch
+
+    class _AudioSignalStub:
+        pass
+
+    class _BaseModelStub(torch.nn.Module):
+        pass
+
+    audiotools_module = types.ModuleType("audiotools")
+    audiotools_module.AudioSignal = _AudioSignalStub
+
+    audiotools_ml_module = types.ModuleType("audiotools.ml")
+    audiotools_ml_module.BaseModel = _BaseModelStub
+    audiotools_module.ml = audiotools_ml_module
+
+    sys.modules["audiotools"] = audiotools_module
+    sys.modules["audiotools.ml"] = audiotools_ml_module
+    sys.modules.pop("fish_speech.models.dac.modded_dac", None)
+    importlib.invalidate_caches()
 
 
 def _ensure_local_fish_ready():
@@ -236,6 +326,7 @@ def _load_local_models():
             max_seq_len=_TEXT_MODEL.config.max_seq_len,
             dtype=next(_TEXT_MODEL.parameters()).dtype,
         )
+    _install_codec_import_stubs()
     _CODEC_MODEL = load_codec_model(FISH_CHECKPOINT_DIR / "codec.pth", FISH_CODEC_DEVICE, codec_precision)
     _MODEL_LOAD_SECONDS = time.time() - start
     print(f"[Fish Local] Models loaded in {_MODEL_LOAD_SECONDS:.1f}s.")
