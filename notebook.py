@@ -710,8 +710,9 @@ def generate_speech(text, language, ref_audio, instruct,
         if not codes:
             return None, "Fish S2 Pro returned no audio codes."
 
-        merged_codes = torch.cat(codes, dim=1).to(FISH_CODEC_DEVICE)
-        audio = decode_to_audio(merged_codes, _CODEC_MODEL)
+        merged_codes = torch.cat(codes, dim=1).to(FISH_CODEC_DEVICE).clone()
+        with torch.no_grad():
+            audio = decode_to_audio(merged_codes, _CODEC_MODEL)
         audio_path = _new_output_path()
         sf.write(audio_path, audio.cpu().float().numpy(), _CODEC_MODEL.sample_rate)
         duration_seconds, sr = _wav_duration(audio_path)
