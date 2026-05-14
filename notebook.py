@@ -265,6 +265,7 @@ def _install_codec_import_stubs():
     """
     import importlib
     import types
+    import traceback
 
     import torch
 
@@ -272,6 +273,10 @@ def _install_codec_import_stubs():
         pass
 
     class _BaseModelStub(torch.nn.Module):
+        INTERN = []
+        EXTERN = []
+
+    class _AcceleratorStub:
         pass
 
     audiotools_module = types.ModuleType("audiotools")
@@ -279,12 +284,26 @@ def _install_codec_import_stubs():
 
     audiotools_ml_module = types.ModuleType("audiotools.ml")
     audiotools_ml_module.BaseModel = _BaseModelStub
+    audiotools_ml_module.Accelerator = _AcceleratorStub
     audiotools_module.ml = audiotools_ml_module
 
     sys.modules["audiotools"] = audiotools_module
     sys.modules["audiotools.ml"] = audiotools_ml_module
+    for module_name in list(sys.modules):
+        if module_name == "dac" or module_name.startswith("dac."):
+            sys.modules.pop(module_name, None)
     sys.modules.pop("fish_speech.models.dac.modded_dac", None)
+    sys.modules.pop("fish_speech.models.dac.rvq", None)
     importlib.invalidate_caches()
+
+    try:
+        importlib.import_module("fish_speech.models.dac.modded_dac")
+        importlib.import_module("fish_speech.models.dac.rvq")
+    except Exception as exc:
+        raise RuntimeError(
+            "Fish DAC import failed before Hydra codec instantiation:\n"
+            f"{traceback.format_exc()}"
+        ) from exc
 
 
 def _ensure_local_fish_ready():
