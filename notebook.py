@@ -128,13 +128,11 @@ def _verify_fish_runtime_imports():
     importlib.invalidate_caches()
     from fish_speech.models.text2semantic.inference import (  # noqa: F401
         decode_to_audio,
-        encode_audio,
         generate_long,
         init_model,
         load_codec_model,
     )
     import soundfile  # noqa: F401
-    import torchaudio  # noqa: F401
 
 
 def _ensure_fish_package():
@@ -313,6 +311,46 @@ def _apply_speed_hint(text, speed):
     return text
 
 
+def _resample_audio(data, sr, target_sr):
+    if sr == target_sr:
+        return data.astype(np.float32)
+
+    try:
+        import math
+        from scipy.signal import resample_poly
+
+        gcd = math.gcd(int(sr), int(target_sr))
+        return resample_poly(data, target_sr // gcd, sr // gcd).astype(np.float32)
+    except Exception:
+        target_len = max(1, int(round(len(data) * target_sr / sr)))
+        return np.interp(
+            np.linspace(0, len(data) - 1, target_len),
+            np.arange(len(data)),
+            data,
+        ).astype(np.float32)
+
+
+def _encode_audio_local(audio_path, codec, device):
+    import soundfile as sf
+    import torch
+
+    data, sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    if data.size == 0:
+        raise RuntimeError(f"Reference audio is empty: {audio_path}")
+
+    target_sr = int(codec.sample_rate)
+    data = _resample_audio(data.astype(np.float32), int(sr), target_sr)
+
+    wav = torch.from_numpy(data).to(device)
+    model_dtype = next(codec.parameters()).dtype
+    audios = wav[None, None].to(dtype=model_dtype)
+    audio_lengths = torch.tensor([wav.numel()], device=device, dtype=torch.long)
+    indices, feature_lengths = codec.encode(audios, audio_lengths)
+    return indices[0, :, : feature_lengths[0]]
+
+
 def _new_output_path():
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -438,7 +476,6 @@ def generate_speech(text, language, ref_audio, instruct,
         import torch
         from fish_speech.models.text2semantic.inference import (
             decode_to_audio,
-            encode_audio,
             generate_long,
         )
 
@@ -455,7 +492,7 @@ def generate_speech(text, language, ref_audio, instruct,
                 ref_text,
                 lang_code,
             )
-            prompt_tokens = [encode_audio(ref_audio, _CODEC_MODEL, FISH_CODEC_DEVICE).cpu()]
+            prompt_tokens = [_encode_audio_local(ref_audio, _CODEC_MODEL, FISH_CODEC_DEVICE).cpu()]
 
         torch.manual_seed(FISH_SEED)
         if torch.cuda.is_available():
