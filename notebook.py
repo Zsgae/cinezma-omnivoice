@@ -1,56 +1,247 @@
 #!/usr/bin/env python3
 """
-OmniVoice - cinEZma Edition
+Fish Audio S2 Pro - cinEZma Edition
 Auto-pulled from GitHub by the Kaggle launcher notebook.
-Edit this file and push to GitHub — changes take effect on next Kaggle restart.
+Edit this file and push to GitHub; changes take effect on next Kaggle restart.
 """
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 import glob
 import logging
+import mimetypes
 import os
 from pathlib import Path
+import tempfile
+import time
+import wave
 
 import numpy as np
-import torch
-from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+import requests
 
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(name)s %(levelname)s: %(message)s",
 )
-logging.getLogger("omnivoice").setLevel(logging.INFO)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-torch.backends.cuda.matmul.allow_tf32 = True
+FISH_MODEL = os.environ.get("FISH_MODEL") or os.environ.get("FISH_AUDIO_MODEL") or "s2-pro"
+FISH_TTS_URL = os.environ.get("FISH_TTS_URL", "https://api.fish.audio/v1/tts")
+FISH_ASR_URL = os.environ.get("FISH_ASR_URL", "https://api.fish.audio/v1/asr")
+FISH_TIMEOUT = int(os.environ.get("FISH_TIMEOUT", "180"))
+FISH_SAMPLE_RATE = int(os.environ.get("FISH_SAMPLE_RATE", "44100"))
+FISH_FORMAT = "wav"
+FISH_LATENCY = os.environ.get("FISH_LATENCY", "normal")
+FISH_DEFAULT_REFERENCE_ID = os.environ.get("FISH_REFERENCE_ID", "").strip()
 
-CHECKPOINT = "k2-fsa/OmniVoice"
 VOICES_DIR = "/kaggle/working/voice-assets/voices"
+OUTPUT_DIR = os.environ.get("FISH_OUTPUT_DIR", "/kaggle/working/fish-audio-output")
 
-print(f"Loading model from {CHECKPOINT} ...")
-model = OmniVoice.from_pretrained(
-    CHECKPOINT,
-    device_map="cuda",
-    dtype=torch.float16,
-    load_asr=True,
-    token=False,
-)
-sampling_rate = model.sampling_rate
+_API_KEY_NAMES = ("FISH_API_KEY", "FISH_AUDIO_API_KEY")
+
+
+def _get_fish_api_key():
+    for name in _API_KEY_NAMES:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+
+    try:
+        from kaggle_secrets import UserSecretsClient
+
+        secrets = UserSecretsClient()
+        for name in _API_KEY_NAMES:
+            try:
+                value = secrets.get_secret(name)
+            except Exception:
+                value = None
+            if value and value.strip():
+                return value.strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def _language_code(language):
+    if language and language != "Auto":
+        return language.split("(")[-1].rstrip(")").strip() if "(" in language else language
+    return None
+
+
+def _clamp_float(value, default, minimum, maximum):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _clamp_int(value, default, minimum, maximum):
+    return int(round(_clamp_float(value, default, minimum, maximum)))
+
+
+def _pack_msgpack(payload):
+    try:
+        import ormsgpack
+
+        return ormsgpack.packb(payload)
+    except ImportError:
+        try:
+            import msgpack
+
+            return msgpack.packb(payload, use_bin_type=True)
+        except ImportError as exc:
+            raise RuntimeError(
+                "Reference-audio cloning needs MessagePack. In Kaggle, install one "
+                "of these before launching: pip install ormsgpack"
+            ) from exc
+
+
+def _fish_error(response):
+    try:
+        body = response.json()
+        detail = body.get("message") or body.get("detail") or body
+    except Exception:
+        detail = response.text[:1000]
+    return f"Fish Audio API {response.status_code}: {detail}"
+
+
+def _fish_headers(api_key, content_type):
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": content_type,
+        "model": FISH_MODEL,
+    }
+
+
+def _post_fish_tts(payload, api_key, needs_msgpack):
+    if needs_msgpack:
+        response = requests.post(
+            FISH_TTS_URL,
+            data=_pack_msgpack(payload),
+            headers=_fish_headers(api_key, "application/msgpack"),
+            timeout=FISH_TIMEOUT,
+        )
+    else:
+        response = requests.post(
+            FISH_TTS_URL,
+            json=payload,
+            headers=_fish_headers(api_key, "application/json"),
+            timeout=FISH_TIMEOUT,
+        )
+
+    if not response.ok:
+        raise RuntimeError(_fish_error(response))
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type:
+        raise RuntimeError(f"Fish Audio API returned JSON instead of audio: {response.text[:1000]}")
+    return response.content
+
+
+def _guess_audio_mime(audio_path):
+    guessed, _ = mimetypes.guess_type(audio_path)
+    return guessed or "audio/wav"
+
+
+def _transcribe_reference_audio(audio_path, lang_code, api_key):
+    data = {"ignore_timestamps": "true"}
+    if lang_code:
+        data["language"] = lang_code
+
+    with open(audio_path, "rb") as audio_file:
+        response = requests.post(
+            FISH_ASR_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            data=data,
+            files={"audio": (Path(audio_path).name, audio_file, _guess_audio_mime(audio_path))},
+            timeout=FISH_TIMEOUT,
+        )
+
+    if not response.ok:
+        raise RuntimeError(_fish_error(response))
+
+    transcript = response.json().get("text", "").strip()
+    if not transcript:
+        raise RuntimeError("Fish ASR returned an empty transcript. Please type the reference text.")
+    return transcript
+
+
+def _load_sidecar_transcript(audio_path):
+    base = Path(audio_path)
+    for suffix in (".txt", ".lab", ".transcript.txt"):
+        candidate = base.with_suffix(suffix)
+        if candidate.exists():
+            text = candidate.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+    return ""
+
+
+def _prepare_reference(audio_path, ref_text, lang_code, api_key):
+    if not audio_path:
+        raise RuntimeError("Please provide a reference audio.")
+    if not os.path.exists(audio_path):
+        raise RuntimeError(f"Reference audio not found: {audio_path}")
+
+    transcript = (ref_text or "").strip()
+    transcript_source = "typed transcript"
+    if not transcript:
+        transcript = _load_sidecar_transcript(audio_path)
+        transcript_source = "sidecar transcript"
+    if not transcript:
+        transcript = _transcribe_reference_audio(audio_path, lang_code, api_key)
+        transcript_source = "Fish ASR transcript"
+
+    with open(audio_path, "rb") as audio_file:
+        audio_bytes = audio_file.read()
+
+    return [{"audio": audio_bytes, "text": transcript}], transcript_source
+
+
+def _apply_design_tag(text, instruct):
+    if instruct and instruct.strip():
+        return f"[{instruct.strip()}] {text.strip()}"
+    return text.strip()
+
+
+def _write_audio_file(audio_bytes):
+    out_dir = OUTPUT_DIR
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError:
+        out_dir = tempfile.gettempdir()
+
+    out_path = os.path.join(out_dir, f"fish_s2_pro_{int(time.time() * 1000)}.wav")
+    with open(out_path, "wb") as output:
+        output.write(audio_bytes)
+    return out_path
+
+
+def _wav_duration(audio_path):
+    try:
+        with wave.open(audio_path, "rb") as wav_file:
+            sr = wav_file.getframerate()
+            duration = wav_file.getnframes() / float(sr)
+        return duration, sr
+    except Exception:
+        return None, FISH_SAMPLE_RATE
 
 def get_characters():
     wavs = glob.glob(os.path.join(VOICES_DIR, "*.wav"))
     return {Path(w).stem: w for w in sorted(wavs)}
 
-print(f"Model loaded. Sampling rate: {sampling_rate} Hz")
+print(f"Fish Audio model configured: {FISH_MODEL}")
+print(f"Fish Audio TTS endpoint: {FISH_TTS_URL}")
 print(f"Preset voices found: {len(get_characters())}")
 
 
 # ── Gradio UI + Relay ─────────────────────────────────────────────────────────
 import gradio as gr
-import requests
-import time
 
-RELAY_URL = "https://omnivoice-relay.zsage84869.workers.dev/register"
+RELAY_URL = os.environ.get(
+    "FISH_RELAY_URL",
+    os.environ.get("RELAY_URL", "https://omnivoice-relay.zsage84869.workers.dev/register"),
+)
 
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
@@ -65,9 +256,9 @@ button.primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !
 
 BRAND_HTML = """
 <div class="brand-header">
-  <div class="brand-title">OmniVoice Demo</div>
+  <div class="brand-title">Fish Audio S2 Pro Demo</div>
   <div class="brand-subtitle">cinEZma Edition</div>
-  <div class="hint">Preset character voices + custom clone + voice design + relay auto-connect</div>
+  <div class="hint">Preset character voices + custom clone + S2 inline control + relay auto-connect</div>
 </div>
 """
 
@@ -84,26 +275,27 @@ def lang_dropdown():
 
 def gen_settings():
     with gr.Accordion("Advanced Settings", open=False):
-        ns = gr.Slider(8, 64, value=32, step=1, label="Inference Steps")
-        gs = gr.Slider(0.0, 10.0, value=3.0, step=0.1, label="Guidance Scale")
-        dn = gr.Slider(0.0, 1.0, value=0.8, step=0.05, label="Denoise Ratio")
+        ns = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Temperature")
+        gs = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Top P")
+        dn = gr.Slider(100, 300, value=200, step=10, label="Chunk Length")
         sp = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed")
-        du = gr.Slider(0, 30, value=0, step=0.5, label="Duration (0 = auto)")
-        pp = gr.Checkbox(value=True, label="Preprocess Prompt")
-        po = gr.Checkbox(value=True, label="Postprocess Output")
+        du = gr.Slider(256, 4096, value=1024, step=64, label="Max New Tokens")
+        pp = gr.Checkbox(value=True, label="Normalize Text")
+        po = gr.Checkbox(value=True, label="Condition On Previous Chunks")
     return ns, gs, dn, sp, du, pp, po
 
 CATEGORIES = {
     "Gender": ["male", "female"],
     "Age": ["child", "teenager", "young adult", "middle-aged", "elderly"],
     "Pitch": ["very low pitch", "low pitch", "moderate pitch", "high pitch", "very high pitch"],
-    "Style": ["whisper"],
+    "Style": ["whisper", "soft spoken", "excited", "sad", "angry", "dramatic", "broadcast tone"],
     "English Accent": ["american accent", "british accent", "australian accent",
                        "canadian accent", "indian accent", "chinese accent",
                        "japanese accent", "korean accent", "portuguese accent",
                        "russian accent"],
     "Chinese Dialect": ["四川话", "陕西话", "广东话", "东北话", "河南话",
                         "云南话", "贵州话", "桂林话", "济南话"],
+    "Texture": ["breathy", "raspy", "clear", "warm", "low energy", "high energy"],
 }
 
 ATTR_INFO = {
@@ -113,6 +305,7 @@ ATTR_INFO = {
     "Style": "Speaking style",
     "English Accent": "English accent (effective for English text)",
     "Chinese Dialect": "Chinese dialect (effective for Chinese text)",
+    "Texture": "Extra voice texture or delivery direction",
 }
 
 def build_instruct(groups):
@@ -125,56 +318,63 @@ def refresh_characters():
     return gr.update(choices=choices, value=choices[0] if choices else None)
 
 def generate_speech(text, language, ref_audio, instruct,
-                    num_step, guidance_scale, denoise,
-                    speed, duration, preprocess_prompt, postprocess_output,
+                    temperature, top_p, chunk_length,
+                    speed, max_new_tokens, normalize_text, condition_on_previous_chunks,
                     mode="clone", ref_text=None):
     if not text or not text.strip():
         return None, "Please enter some text."
 
-    lang_code = None
-    if language and language != "Auto":
-        lang_code = language.split("(")[-1].rstrip(")").strip() if "(" in language else language
-
-    gen_config = OmniVoiceGenerationConfig(
-        num_step=int(num_step or 32),
-        guidance_scale=float(guidance_scale) if guidance_scale is not None else 2.0,
-        denoise=bool(denoise) if denoise is not None else True,
-        preprocess_prompt=bool(preprocess_prompt),
-        postprocess_output=bool(postprocess_output),
-    )
-
-    kw = {
-        "text": text.strip(),
-        "language": lang_code,
-        "generation_config": gen_config,
-    }
-
-    if speed is not None and float(speed) != 1.0:
-        kw["speed"] = float(speed)
-    if duration is not None and float(duration) > 0:
-        kw["duration"] = float(duration)
-
-    if mode == "clone":
-        if ref_audio is None:
-            return None, "Please provide a reference audio."
-        kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-        )
-
-    if mode == "design" and instruct and instruct.strip():
-        kw["instruct"] = instruct.strip()
-
     try:
-        audio = model.generate(**kw)
+        api_key = _get_fish_api_key()
+        if not api_key:
+            return None, "Missing FISH_API_KEY. Add it as a Kaggle secret or environment variable."
+
+        lang_code = _language_code(language)
+        payload = {
+            "text": _apply_design_tag(text, instruct if mode == "design" else None),
+            "format": FISH_FORMAT,
+            "sample_rate": FISH_SAMPLE_RATE,
+            "temperature": _clamp_float(temperature, 0.7, 0.0, 1.0),
+            "top_p": _clamp_float(top_p, 0.7, 0.0, 1.0),
+            "chunk_length": _clamp_int(chunk_length, 200, 100, 300),
+            "max_new_tokens": _clamp_int(max_new_tokens, 1024, 256, 4096),
+            "normalize": bool(normalize_text),
+            "condition_on_previous_chunks": bool(condition_on_previous_chunks),
+            "latency": FISH_LATENCY,
+            "prosody": {
+                "speed": _clamp_float(speed, 1.0, 0.5, 2.0),
+                "volume": 0,
+                "normalize_loudness": True,
+            },
+        }
+
+        transcript_source = None
+        needs_msgpack = False
+
+        if mode == "clone":
+            payload["references"], transcript_source = _prepare_reference(
+                ref_audio,
+                ref_text,
+                lang_code,
+                api_key,
+            )
+            needs_msgpack = True
+        elif FISH_DEFAULT_REFERENCE_ID:
+            payload["reference_id"] = FISH_DEFAULT_REFERENCE_ID
+
+        audio_bytes = _post_fish_tts(payload, api_key, needs_msgpack)
+        audio_path = _write_audio_file(audio_bytes)
+        duration_seconds, sr = _wav_duration(audio_path)
     except Exception as e:
         return None, f"Error: {type(e).__name__}: {e}"
 
-    waveform = audio[0].squeeze()
-    if hasattr(waveform, "numpy"):
-        waveform = waveform.numpy()
-    waveform = (waveform * 32767).astype(np.int16)
-    return (sampling_rate, waveform), f"Generated {waveform.shape[-1] / sampling_rate:.1f}s audio at {sampling_rate}Hz"
+    if duration_seconds is None:
+        status = f"Generated audio with Fish Audio {FISH_MODEL}."
+    else:
+        status = f"Generated {duration_seconds:.1f}s audio with Fish Audio {FISH_MODEL} at {sr}Hz."
+    if transcript_source:
+        status += f" Reference used: {transcript_source}."
+    return audio_path, status
 
 def generate_preset(text, language, character_name, ref_text, ns, gs, dn, sp, du, pp, po):
     characters = get_characters()
@@ -241,12 +441,14 @@ def _detect_silences(data: np.ndarray, sr: int,
             if in_silence:
                 in_silence = False
                 if t - gap_start >= min_silence_sec:
-                    silences.append([round(gap_start, 3), round(t, 3)])
+                    silences.append({"start": round(gap_start, 3),
+                                     "end":   round(t, 3)})
 
     if in_silence:
         t_end = n_frames * frame_ms / 1000.0
         if t_end - gap_start >= min_silence_sec:
-            silences.append([round(gap_start, 3), round(t_end, 3)])
+            silences.append({"start": round(gap_start, 3),
+                             "end":   round(t_end, 3)})
     return silences
 
 
@@ -336,7 +538,7 @@ def align_japanese(audio_path: str, japanese_text: str, translation_map_json: st
             if not text:
                 continue
             stamps.append({
-                "word":  text,
+                "text":  text,
                 "start": round(float(wt.get("start", 0)), 3),
                 "end":   round(float(wt.get("end",   0)), 3),
             })
@@ -406,7 +608,7 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
 
 
 
-with gr.Blocks(title="OmniVoice Demo") as demo:
+with gr.Blocks(title="Fish Audio S2 Pro Demo") as demo:
     gr.HTML(BRAND_HTML)
 
     with gr.Tabs():
@@ -430,7 +632,7 @@ with gr.Blocks(title="OmniVoice Demo") as demo:
                     pv_ref_text = gr.Textbox(
                         label="Reference Text (optional)",
                         lines=2,
-                        placeholder="Transcript of the preset clip. Leave blank for auto-transcription.",
+                        placeholder="Transcript of the preset clip. Leave blank to use sidecar text or Fish ASR.",
                     )
                     pv_lang = lang_dropdown()
                     pv_ns, pv_gs, pv_dn, pv_sp, pv_du, pv_pp, pv_po = gen_settings()
@@ -453,7 +655,7 @@ with gr.Blocks(title="OmniVoice Demo") as demo:
                     vc_text = gr.Textbox(
                         label="Text to Synthesize",
                         lines=4,
-                        placeholder="Enter text here... You can use tags like [laughter], [sigh], etc.",
+                        placeholder="Enter text here... You can use Fish tags like [laughs], [sighs], etc.",
                     )
                     vc_ref_audio = gr.Audio(
                         label="Reference Audio (3-10s recommended)",
@@ -462,7 +664,7 @@ with gr.Blocks(title="OmniVoice Demo") as demo:
                     vc_ref_text = gr.Textbox(
                         label="Reference Text (optional)",
                         lines=2,
-                        placeholder="Transcript of ref audio. Leave blank for auto-transcription.",
+                        placeholder="Transcript of ref audio. Leave blank to use Fish ASR.",
                     )
                     vc_lang = lang_dropdown()
                     vc_ns, vc_gs, vc_dn, vc_sp, vc_du, vc_pp, vc_po = gen_settings()
