@@ -1,580 +1,56 @@
 #!/usr/bin/env python3
 """
-Fish Audio S2 Pro - cinEZma Edition
+OmniVoice - cinEZma Edition
 Auto-pulled from GitHub by the Kaggle launcher notebook.
-Edit this file and push to GitHub; changes take effect on next Kaggle restart.
+Edit this file and push to GitHub — changes take effect on next Kaggle restart.
 """
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 import glob
 import logging
 import os
-import shutil
-import subprocess
-import sys
 from pathlib import Path
-import tempfile
-import time
-import wave
 
 import numpy as np
+import torch
+from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(name)s %(levelname)s: %(message)s",
 )
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-os.environ.setdefault("HYDRA_FULL_ERROR", "1")
+logging.getLogger("omnivoice").setLevel(logging.INFO)
 
-FISH_MODEL = os.environ.get("FISH_MODEL") or "fishaudio/s2-pro"
-FISH_REPO_URL = os.environ.get("FISH_REPO_URL", "https://github.com/fishaudio/fish-speech.git")
-FISH_REPO_REF = os.environ.get("FISH_REPO_REF", "main")
-FISH_ROOT = Path(os.environ.get("FISH_ROOT", "/kaggle/working/fish-speech"))
-FISH_CHECKPOINT_DIR = Path(
-    os.environ.get("FISH_CHECKPOINT_DIR", str(FISH_ROOT / "checkpoints" / "s2-pro"))
-)
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+torch.backends.cuda.matmul.allow_tf32 = True
+
+CHECKPOINT = "k2-fsa/OmniVoice"
 VOICES_DIR = "/kaggle/working/voice-assets/voices"
-OUTPUT_DIR = Path(os.environ.get("FISH_OUTPUT_DIR", "/kaggle/working/fish-audio-output"))
-FISH_DEVICE = os.environ.get("FISH_DEVICE", "cuda")
-FISH_CODEC_DEVICE = os.environ.get("FISH_CODEC_DEVICE", "cpu")
-# NOTE: set FISH_CODEC_DEVICE=cuda to run the codec on GPU for much faster decode.
-# CPU is the safe default (avoids VRAM pressure) but adds ~2-4x latency on long clips.
-FISH_TOP_K = int(os.environ.get("FISH_TOP_K", "30"))
-FISH_SEED = int(os.environ.get("FISH_SEED", "42"))
 
-
-def _env_flag(name, default=False):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off", ""}
-
-
-FISH_AUTO_SETUP = _env_flag("FISH_AUTO_SETUP", True)
-FISH_APT_SETUP = _env_flag("FISH_APT_SETUP", True)
-FISH_HALF = _env_flag("FISH_HALF", True)
-FISH_COMPILE = _env_flag("FISH_COMPILE", False)
-FISH_LOCAL_ASR = _env_flag("FISH_LOCAL_ASR", False)
-FISH_LOCAL_ASR_MODEL = os.environ.get("FISH_LOCAL_ASR_MODEL", "small")
-
-_FISH_READY = False
-_TEXT_MODEL = None
-_DECODE_ONE_TOKEN = None
-_CODEC_MODEL = None
-_MODEL_LOAD_SECONDS = None
-
-
-def _language_code(language):
-    if language and language != "Auto":
-        return language.split("(")[-1].rstrip(")").strip() if "(" in language else language
-    return None
-
-
-def _clamp_float(value, default, minimum, maximum):
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        parsed = default
-    return max(minimum, min(maximum, parsed))
-
-
-def _clamp_int(value, default, minimum, maximum):
-    return int(round(_clamp_float(value, default, minimum, maximum)))
-
-
-def _run_cmd(cmd, cwd=None, timeout=None):
-    printable = " ".join(str(part) for part in cmd)
-    print(f"[Fish Local] {printable}")
-    result = subprocess.run(
-        [str(part) for part in cmd],
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        tail = (result.stdout or "")[-4000:]
-        raise RuntimeError(f"Command failed ({result.returncode}): {printable}\n{tail}")
-    if result.stdout:
-        print(result.stdout[-1200:])
-    return result.stdout or ""
-
-
-def _metadata_version(package_name):
-    try:
-        from importlib import metadata
-
-        return metadata.version(package_name)
-    except Exception:
-        return None
-
-
-def _parse_version(version):
-    try:
-        from packaging.version import Version
-
-        return Version(version)
-    except Exception:
-        return None
-
-
-def _ensure_fish_runtime_versions():
-    if not FISH_AUTO_SETUP:
-        return
-
-    needs_fix = []
-    transformers_version = _metadata_version("transformers")
-    protobuf_version = _metadata_version("protobuf")
-
-    parsed_transformers = _parse_version(transformers_version) if transformers_version else None
-    parsed_protobuf = _parse_version(protobuf_version) if protobuf_version else None
-
-    if parsed_transformers is None or parsed_transformers > _parse_version("4.57.3"):
-        needs_fix.append(f"transformers={transformers_version or 'missing'}")
-    if (
-        parsed_protobuf is None
-        or parsed_protobuf < _parse_version("3.20.0")
-        or parsed_protobuf >= _parse_version("6.0.0")
-    ):
-        needs_fix.append(f"protobuf={protobuf_version or 'missing'}")
-
-    if not needs_fix:
-        return
-
-    print(f"[Fish Local] Repairing Fish runtime versions: {', '.join(needs_fix)}")
-    _run_cmd(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "transformers==4.57.3",
-            "protobuf==5.29.5",
-        ],
-        timeout=None,
-    )
-
-
-def _ensure_fish_repo():
-    if (FISH_ROOT / "fish_speech").exists():
-        return
-    if not FISH_AUTO_SETUP:
-        raise RuntimeError(f"Fish Speech repo not found at {FISH_ROOT}.")
-    if not shutil.which("git"):
-        raise RuntimeError("git is required to clone fish-speech into Kaggle working storage.")
-
-    FISH_ROOT.parent.mkdir(parents=True, exist_ok=True)
-    _run_cmd(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            FISH_REPO_REF,
-            FISH_REPO_URL,
-            str(FISH_ROOT),
-        ],
-        timeout=None,
-    )
-
-
-def _verify_fish_runtime_imports():
-    import importlib
-
-    importlib.invalidate_caches()
-    from fish_speech.models.text2semantic.inference import (  # noqa: F401
-        decode_to_audio,
-        generate_long,
-        init_model,
-        load_codec_model,
-    )
-    import soundfile  # noqa: F401
-
-
-def _ensure_fish_package():
-    if str(FISH_ROOT) not in sys.path:
-        sys.path.insert(0, str(FISH_ROOT))
-    _ensure_fish_runtime_versions()
-    try:
-        _verify_fish_runtime_imports()
-
-        return
-    except ModuleNotFoundError as exc:
-        missing_dep = exc.name
-        if not FISH_AUTO_SETUP:
-            raise
-        print(f"[Fish Local] Missing Python dependency '{missing_dep}'. Installing Fish Speech package deps ...")
-    except Exception:
-        if not FISH_AUTO_SETUP:
-            raise
-        print("[Fish Local] Fish Speech runtime import failed. Installing Fish Speech package deps ...")
-
-    install_target = os.environ.get("FISH_PIP_TARGET", ".")
-    _run_cmd([sys.executable, "-m", "pip", "install", "-e", install_target], cwd=FISH_ROOT, timeout=None)
-
-    if str(FISH_ROOT) not in sys.path:
-        sys.path.insert(0, str(FISH_ROOT))
-    _ensure_fish_runtime_versions()
-    _verify_fish_runtime_imports()
-
-
-def _ensure_system_deps():
-    if not FISH_AUTO_SETUP or not FISH_APT_SETUP or not shutil.which("apt-get"):
-        return
-    marker = Path("/kaggle/working/.fish_speech_system_deps_ok")
-    if marker.exists():
-        return
-    _run_cmd(["apt-get", "update"], timeout=None)
-    _run_cmd(["apt-get", "install", "-y", "portaudio19-dev", "libsox-dev", "ffmpeg"], timeout=None)
-    try:
-        marker.touch()
-    except OSError:
-        pass
-
-
-def _ensure_fish_weights():
-    # s2-pro uses sharded safetensors — there is no model.pth.
-    # We consider weights present if the checkpoint dir exists, contains a
-    # config.json (always present after a complete snapshot_download), and has
-    # at least one .safetensors shard.  Checking codec.pth separately would
-    # re-download on every boot since s2-pro may name the codec differently.
-    config_path = FISH_CHECKPOINT_DIR / "config.json"
-    has_shards = bool(list(FISH_CHECKPOINT_DIR.glob("*.safetensors"))) if FISH_CHECKPOINT_DIR.exists() else False
-    if config_path.exists() and has_shards:
-        return
-    if not FISH_AUTO_SETUP:
-        raise RuntimeError(f"Fish S2 Pro weights missing at {FISH_CHECKPOINT_DIR}.")
-
-    try:
-        from huggingface_hub import snapshot_download
-    except Exception:
-        _run_cmd([sys.executable, "-m", "pip", "install", "huggingface_hub"], timeout=None)
-        from huggingface_hub import snapshot_download
-
-    FISH_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"[Fish Local] Downloading {FISH_MODEL} to {FISH_CHECKPOINT_DIR} ...")
-    snapshot_download(
-        repo_id=FISH_MODEL,
-        local_dir=str(FISH_CHECKPOINT_DIR),
-        local_dir_use_symlinks=False,
-    )
-
-
-def _install_codec_import_stubs():
-    """
-    Fish's DAC codec imports audiotools for training/export helpers that are not
-    needed for inference.  We stub out the entire audiotools namespace and manually
-    load only the two DAC submodules Fish actually needs: dac.model.base and
-    dac.nn.layers.  This avoids the STFTParams / audiotools.data crash while
-    keeping dac.model.base's real nn.Module definitions intact.
-
-    Stub coverage:
-      audiotools                – AudioSignal, STFTParams
-      audiotools.ml             – BaseModel (nn.Module subclass), Accelerator
-      audiotools.core           – empty package (dac.model.base may import from here)
-      audiotools.data           – empty package + data.audio sub-stub
-      audiotools.ml.decorators  – empty (used by BaseModel class body in some versions)
-    """
-    import importlib
-    import importlib.util
-    import types
-    import traceback
-
-    import torch
-
-    class _AudioSignalStub:
-        pass
-
-    class _STFTParamsStub:
-        pass
-
-    class _BaseModelStub(torch.nn.Module):
-        INTERN = []
-        EXTERN = []
-
-    class _AcceleratorStub:
-        pass
-
-    def _make_stub(name, parent=None, **attrs):
-        m = types.ModuleType(name)
-        m.__path__ = []          # make it look like a package
-        for k, v in attrs.items():
-            setattr(m, k, v)
-        sys.modules[name] = m
-        if parent is not None:
-            setattr(parent, name.split(".")[-1], m)
-        return m
-
-    # Root audiotools stub
-    at = _make_stub("audiotools",
-                    AudioSignal=_AudioSignalStub,
-                    STFTParams=_STFTParamsStub)
-
-    # audiotools.ml
-    at_ml = _make_stub("audiotools.ml", parent=at,
-                       BaseModel=_BaseModelStub,
-                       Accelerator=_AcceleratorStub)
-    _make_stub("audiotools.ml.decorators", parent=at_ml)
-
-    # audiotools.core  (dac.model.base may do `from audiotools.core import ...`)
-    at_core = _make_stub("audiotools.core", parent=at)
-
-    # audiotools.data  (some DAC versions: `from audiotools.data.audio import AudioSignal`)
-    at_data = _make_stub("audiotools.data", parent=at)
-    at_data_audio = _make_stub("audiotools.data.audio", parent=at_data,
-                               AudioSignal=_AudioSignalStub)
-
-    # Flush any previously imported dac modules so our manual load is clean
-    for module_name in list(sys.modules):
-        if module_name == "dac" or module_name.startswith("dac."):
-            sys.modules.pop(module_name, None)
-
-    dac_root = None
-    for entry in sys.path:
-        candidate = Path(entry) / "dac"
-        if (candidate / "model" / "base.py").exists() and (candidate / "nn" / "layers.py").exists():
-            dac_root = candidate
-            break
-    if dac_root is None:
-        raise RuntimeError("Could not find descript-audio-codec package files on sys.path.")
-
-    def _make_package(name, path):
-        module = types.ModuleType(name)
-        module.__path__ = [str(path)]
-        sys.modules[name] = module
-        return module
-
-    def _load_module(name, path):
-        spec = importlib.util.spec_from_file_location(name, str(path))
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Could not load module spec for {name} from {path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        return module
-
-    dac_module = _make_package("dac", dac_root)
-    dac_model_module = _make_package("dac.model", dac_root / "model")
-    dac_nn_module = _make_package("dac.nn", dac_root / "nn")
-    dac_module.model = dac_model_module
-    dac_module.nn = dac_nn_module
-    dac_model_module.base = _load_module("dac.model.base", dac_root / "model" / "base.py")
-    dac_nn_module.layers = _load_module("dac.nn.layers", dac_root / "nn" / "layers.py")
-
-    sys.modules.pop("fish_speech.models.dac.modded_dac", None)
-    sys.modules.pop("fish_speech.models.dac.rvq", None)
-    importlib.invalidate_caches()
-
-    try:
-        importlib.import_module("fish_speech.models.dac.modded_dac")
-        importlib.import_module("fish_speech.models.dac.rvq")
-    except Exception as exc:
-        raise RuntimeError(
-            "Fish DAC import failed before Hydra codec instantiation:\n"
-            f"{traceback.format_exc()}"
-        ) from exc
-
-
-def _ensure_local_fish_ready():
-    global _FISH_READY
-    if _FISH_READY:
-        return
-    _ensure_fish_repo()
-    _ensure_system_deps()
-    _ensure_fish_package()
-    _ensure_fish_weights()
-    _FISH_READY = True
-
-
-def _load_local_models():
-    global _TEXT_MODEL, _DECODE_ONE_TOKEN, _CODEC_MODEL, _MODEL_LOAD_SECONDS
-    _ensure_local_fish_ready()
-    if _TEXT_MODEL is not None and _CODEC_MODEL is not None:
-        return
-
-    import torch
-    from fish_speech.models.text2semantic.inference import init_model, load_codec_model
-
-    if FISH_DEVICE == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("FISH_DEVICE is cuda, but CUDA is not available in this Kaggle session.")
-
-    precision = torch.half if FISH_HALF else torch.bfloat16
-    codec_precision = torch.float32 if FISH_CODEC_DEVICE == "cpu" else precision
-    start = time.time()
-    print(f"[Fish Local] Loading {FISH_MODEL} from {FISH_CHECKPOINT_DIR} on {FISH_DEVICE} ...")
-    _TEXT_MODEL, _DECODE_ONE_TOKEN = init_model(
-        FISH_CHECKPOINT_DIR,
-        FISH_DEVICE,
-        precision,
-        compile=FISH_COMPILE,
-    )
-    with torch.device(FISH_DEVICE):
-        _TEXT_MODEL.setup_caches(
-            max_batch_size=1,
-            max_seq_len=_TEXT_MODEL.config.max_seq_len,
-            dtype=next(_TEXT_MODEL.parameters()).dtype,
-        )
-    _install_codec_import_stubs()
-    _CODEC_MODEL = load_codec_model(FISH_CHECKPOINT_DIR / "codec.pth", FISH_CODEC_DEVICE, codec_precision)
-    _MODEL_LOAD_SECONDS = time.time() - start
-    print(f"[Fish Local] Models loaded in {_MODEL_LOAD_SECONDS:.1f}s.")
-
-
-def _transcribe_reference_audio(audio_path, lang_code=None):
-    if not FISH_LOCAL_ASR:
-        raise RuntimeError(
-            "Local Fish S2 cloning needs the reference transcript. Type it in, "
-            "or place a .txt/.lab sidecar next to the reference wav. To try local "
-            "Whisper auto-transcription, set FISH_LOCAL_ASR=1 before launch."
-        )
-
-    try:
-        from faster_whisper import WhisperModel
-    except Exception:
-        if not FISH_AUTO_SETUP:
-            raise
-        _run_cmd([sys.executable, "-m", "pip", "install", "faster-whisper"], timeout=None)
-        from faster_whisper import WhisperModel
-
-    device = os.environ.get("FISH_LOCAL_ASR_DEVICE", "cpu")
-    compute_type = os.environ.get("FISH_LOCAL_ASR_COMPUTE_TYPE", "int8" if device == "cpu" else "float16")
-    model = WhisperModel(FISH_LOCAL_ASR_MODEL, device=device, compute_type=compute_type)
-    segments, _ = model.transcribe(audio_path, language=lang_code if lang_code else None, beam_size=5)
-    transcript = " ".join(segment.text.strip() for segment in segments).strip()
-    if not transcript:
-        raise RuntimeError("Local Whisper returned an empty transcript. Please type the reference text.")
-    return transcript
-
-
-def _load_sidecar_transcript(audio_path):
-    base = Path(audio_path)
-    for suffix in (".txt", ".lab", ".transcript.txt"):
-        candidate = base.with_suffix(suffix)
-        if candidate.exists():
-            text = candidate.read_text(encoding="utf-8").strip()
-            if text:
-                return text
-    return ""
-
-
-def _prepare_reference(audio_path, ref_text, lang_code):
-    if not audio_path:
-        raise RuntimeError("Please provide a reference audio.")
-    if not os.path.exists(audio_path):
-        raise RuntimeError(f"Reference audio not found: {audio_path}")
-
-    transcript = (ref_text or "").strip()
-    transcript_source = "typed transcript"
-    if not transcript:
-        transcript = _load_sidecar_transcript(audio_path)
-        transcript_source = "sidecar transcript"
-    if not transcript and FISH_LOCAL_ASR:
-        transcript = _transcribe_reference_audio(audio_path, lang_code)
-        transcript_source = "local Whisper transcript"
-    if not transcript:
-        # S2 Pro can clone from audio tokens alone — prompt_text is optional.
-        # Log a heads-up but don't crash; generation will still work.
-        print("[Fish Local] No reference transcript found — cloning from audio only (prompt_text=None).")
-        return None, None
-
-    return transcript, transcript_source
-
-
-def _apply_design_tag(text, instruct):
-    if instruct and instruct.strip():
-        return f"[{instruct.strip()}] {text.strip()}"
-    return text.strip()
-
-
-def _apply_speed_hint(text, speed):
-    speed = _clamp_float(speed, 1.0, 0.5, 2.0)
-    if speed >= 1.15:
-        return f"[speaking quickly] {text}"
-    if speed <= 0.85:
-        return f"[speaking slowly] {text}"
-    return text
-
-
-def _resample_audio(data, sr, target_sr):
-    if sr == target_sr:
-        return data.astype(np.float32)
-
-    try:
-        import math
-        from scipy.signal import resample_poly
-
-        gcd = math.gcd(int(sr), int(target_sr))
-        return resample_poly(data, target_sr // gcd, sr // gcd).astype(np.float32)
-    except Exception:
-        target_len = max(1, int(round(len(data) * target_sr / sr)))
-        return np.interp(
-            np.linspace(0, len(data) - 1, target_len),
-            np.arange(len(data)),
-            data,
-        ).astype(np.float32)
-
-
-def _encode_audio_local(audio_path, codec, device):
-    import soundfile as sf
-    import torch
-
-    data, sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    if data.size == 0:
-        raise RuntimeError(f"Reference audio is empty: {audio_path}")
-
-    target_sr = int(codec.sample_rate)
-    data = _resample_audio(data.astype(np.float32), int(sr), target_sr)
-
-    wav = torch.from_numpy(data).to(device)
-    model_dtype = next(codec.parameters()).dtype
-    audios = wav[None, None].to(dtype=model_dtype)
-    audio_lengths = torch.tensor([wav.numel()], device=device, dtype=torch.long)
-    indices, feature_lengths = codec.encode(audios, audio_lengths)
-    return indices[0, :, : feature_lengths[0]]
-
-
-def _new_output_path():
-    try:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        out_dir = OUTPUT_DIR
-    except OSError:
-        out_dir = Path(tempfile.gettempdir())
-    return str(out_dir / f"fish_s2_pro_{int(time.time() * 1000)}.wav")
-
-
-def _wav_duration(audio_path):
-    try:
-        with wave.open(audio_path, "rb") as wav_file:
-            sr = wav_file.getframerate()
-            duration = wav_file.getnframes() / float(sr)
-        return duration, sr
-    except Exception:
-        return None, 44100
+print(f"Loading model from {CHECKPOINT} ...")
+model = OmniVoice.from_pretrained(
+    CHECKPOINT,
+    device_map="cuda",
+    dtype=torch.float16,
+    load_asr=True,
+    token=False,
+)
+sampling_rate = model.sampling_rate
 
 def get_characters():
     wavs = glob.glob(os.path.join(VOICES_DIR, "*.wav"))
     return {Path(w).stem: w for w in sorted(wavs)}
 
-print(f"Fish Speech local model configured: {FISH_MODEL}")
-print(f"Fish Speech repo path: {FISH_ROOT}")
-print(f"Fish Speech checkpoint path: {FISH_CHECKPOINT_DIR}")
-print(f"Fish Speech devices: model={FISH_DEVICE}, codec={FISH_CODEC_DEVICE}")
+print(f"Model loaded. Sampling rate: {sampling_rate} Hz")
 print(f"Preset voices found: {len(get_characters())}")
 
 
 # ── Gradio UI + Relay ─────────────────────────────────────────────────────────
 import gradio as gr
 import requests
+import time
 
-RELAY_URL = os.environ.get(
-    "FISH_RELAY_URL",
-    os.environ.get("RELAY_URL", "https://omnivoice-relay.zsage84869.workers.dev/register"),
-)
+RELAY_URL = "https://omnivoice-relay.zsage84869.workers.dev/register"
 
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
@@ -589,9 +65,9 @@ button.primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !
 
 BRAND_HTML = """
 <div class="brand-header">
-  <div class="brand-title">Fish Speech S2 Pro Local</div>
+  <div class="brand-title">OmniVoice Demo</div>
   <div class="brand-subtitle">cinEZma Edition</div>
-  <div class="hint">Kaggle GPU generation + preset voices + custom clone + S2 inline control</div>
+  <div class="hint">Preset character voices + custom clone + voice design + relay auto-connect</div>
 </div>
 """
 
@@ -608,27 +84,26 @@ def lang_dropdown():
 
 def gen_settings():
     with gr.Accordion("Advanced Settings", open=False):
-        ns = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Temperature")
-        gs = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Top P")
-        dn = gr.Slider(100, 300, value=200, step=10, label="Chunk Length")
+        ns = gr.Slider(8, 64, value=32, step=1, label="Inference Steps")
+        gs = gr.Slider(0.0, 10.0, value=3.0, step=0.1, label="Guidance Scale")
+        dn = gr.Slider(0.0, 1.0, value=0.8, step=0.05, label="Denoise Ratio")
         sp = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed")
-        du = gr.Slider(256, 4096, value=1024, step=64, label="Max New Tokens")
-        pp = gr.Checkbox(value=True, label="Normalize Text")
-        po = gr.Checkbox(value=True, label="Iterative Prompt")
+        du = gr.Slider(0, 30, value=0, step=0.5, label="Duration (0 = auto)")
+        pp = gr.Checkbox(value=True, label="Preprocess Prompt")
+        po = gr.Checkbox(value=True, label="Postprocess Output")
     return ns, gs, dn, sp, du, pp, po
 
 CATEGORIES = {
     "Gender": ["male", "female"],
     "Age": ["child", "teenager", "young adult", "middle-aged", "elderly"],
     "Pitch": ["very low pitch", "low pitch", "moderate pitch", "high pitch", "very high pitch"],
-    "Style": ["whisper", "soft spoken", "excited", "sad", "angry", "dramatic", "broadcast tone"],
+    "Style": ["whisper"],
     "English Accent": ["american accent", "british accent", "australian accent",
                        "canadian accent", "indian accent", "chinese accent",
                        "japanese accent", "korean accent", "portuguese accent",
                        "russian accent"],
     "Chinese Dialect": ["四川话", "陕西话", "广东话", "东北话", "河南话",
                         "云南话", "贵州话", "桂林话", "济南话"],
-    "Texture": ["breathy", "raspy", "clear", "warm", "low energy", "high energy"],
 }
 
 ATTR_INFO = {
@@ -638,7 +113,6 @@ ATTR_INFO = {
     "Style": "Speaking style",
     "English Accent": "English accent (effective for English text)",
     "Chinese Dialect": "Chinese dialect (effective for Chinese text)",
-    "Texture": "Extra voice texture or delivery direction",
 }
 
 def build_instruct(groups):
@@ -651,81 +125,56 @@ def refresh_characters():
     return gr.update(choices=choices, value=choices[0] if choices else None)
 
 def generate_speech(text, language, ref_audio, instruct,
-                    temperature, top_p, chunk_length,
-                    speed, max_new_tokens, normalize_text, condition_on_previous_chunks,
+                    num_step, guidance_scale, denoise,
+                    speed, duration, preprocess_prompt, postprocess_output,
                     mode="clone", ref_text=None):
     if not text or not text.strip():
         return None, "Please enter some text."
 
+    lang_code = None
+    if language and language != "Auto":
+        lang_code = language.split("(")[-1].rstrip(")").strip() if "(" in language else language
+
+    gen_config = OmniVoiceGenerationConfig(
+        num_step=int(num_step or 32),
+        guidance_scale=float(guidance_scale) if guidance_scale is not None else 2.0,
+        denoise=bool(denoise) if denoise is not None else True,
+        preprocess_prompt=bool(preprocess_prompt),
+        postprocess_output=bool(postprocess_output),
+    )
+
+    kw = {
+        "text": text.strip(),
+        "language": lang_code,
+        "generation_config": gen_config,
+    }
+
+    if speed is not None and float(speed) != 1.0:
+        kw["speed"] = float(speed)
+    if duration is not None and float(duration) > 0:
+        kw["duration"] = float(duration)
+
+    if mode == "clone":
+        if ref_audio is None:
+            return None, "Please provide a reference audio."
+        kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+        )
+
+    if mode == "design" and instruct and instruct.strip():
+        kw["instruct"] = instruct.strip()
+
     try:
-        _load_local_models()
-        import soundfile as sf
-        import torch
-        from fish_speech.models.text2semantic.inference import (
-            decode_to_audio,
-            generate_long,
-        )
-
-        lang_code = _language_code(language)
-        prompt_text = None
-        prompt_tokens = None
-        transcript_source = None
-        clean_text = _apply_design_tag(text, instruct if mode == "design" else None)
-        clean_text = _apply_speed_hint(clean_text, speed)
-
-        if mode == "clone":
-            prompt_text, transcript_source = _prepare_reference(
-                ref_audio,
-                ref_text,
-                lang_code,
-            )
-            prompt_tokens = [_encode_audio_local(ref_audio, _CODEC_MODEL, FISH_CODEC_DEVICE).cpu()]
-
-        torch.manual_seed(FISH_SEED)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(FISH_SEED)
-
-        generator = generate_long(
-            model=_TEXT_MODEL,
-            device=FISH_DEVICE,
-            decode_one_token=_DECODE_ONE_TOKEN,
-            text=clean_text.strip(),
-            num_samples=1,
-            max_new_tokens=_clamp_int(max_new_tokens, 1024, 0, 4096),
-            top_p=_clamp_float(top_p, 0.7, 0.01, 1.0),
-            top_k=FISH_TOP_K,
-            temperature=_clamp_float(temperature, 0.7, 0.01, 1.99),
-            compile=FISH_COMPILE,
-            iterative_prompt=bool(condition_on_previous_chunks),
-            chunk_length=_clamp_int(chunk_length, 300, 100, 300),
-            prompt_text=[prompt_text] if prompt_text else None,
-            prompt_tokens=prompt_tokens,
-        )
-
-        codes = []
-        for response in generator:
-            if response.action == "sample":
-                codes.append(response.codes)
-
-        if not codes:
-            return None, "Fish S2 Pro returned no audio codes."
-
-        merged_codes = torch.cat(codes, dim=1).to(FISH_CODEC_DEVICE).clone()
-        with torch.no_grad():
-            audio = decode_to_audio(merged_codes, _CODEC_MODEL)
-        audio_path = _new_output_path()
-        sf.write(audio_path, audio.cpu().float().numpy(), _CODEC_MODEL.sample_rate)
-        duration_seconds, sr = _wav_duration(audio_path)
+        audio = model.generate(**kw)
     except Exception as e:
         return None, f"Error: {type(e).__name__}: {e}"
 
-    if duration_seconds is None:
-        status = f"Generated audio locally with Fish Speech {FISH_MODEL}."
-    else:
-        status = f"Generated {duration_seconds:.1f}s locally with Fish Speech {FISH_MODEL} at {sr}Hz."
-    if transcript_source:
-        status += f" Reference used: {transcript_source}."
-    return audio_path, status
+    waveform = audio[0].squeeze()
+    if hasattr(waveform, "numpy"):
+        waveform = waveform.numpy()
+    waveform = (waveform * 32767).astype(np.int16)
+    return (sampling_rate, waveform), f"Generated {waveform.shape[-1] / sampling_rate:.1f}s audio at {sampling_rate}Hz"
 
 def generate_preset(text, language, character_name, ref_text, ns, gs, dn, sp, du, pp, po):
     characters = get_characters()
@@ -959,7 +408,7 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
 
 
 
-with gr.Blocks(title="Fish Speech S2 Pro Local") as demo:
+with gr.Blocks(title="OmniVoice Demo") as demo:
     gr.HTML(BRAND_HTML)
 
     with gr.Tabs():
@@ -983,7 +432,7 @@ with gr.Blocks(title="Fish Speech S2 Pro Local") as demo:
                     pv_ref_text = gr.Textbox(
                         label="Reference Text (optional)",
                         lines=2,
-                        placeholder="Transcript of the preset clip. Blank uses .txt/.lab sidecar or local Whisper if enabled.",
+                        placeholder="Transcript of the preset clip. Leave blank for auto-transcription.",
                     )
                     pv_lang = lang_dropdown()
                     pv_ns, pv_gs, pv_dn, pv_sp, pv_du, pv_pp, pv_po = gen_settings()
@@ -1006,7 +455,7 @@ with gr.Blocks(title="Fish Speech S2 Pro Local") as demo:
                     vc_text = gr.Textbox(
                         label="Text to Synthesize",
                         lines=4,
-                        placeholder="Enter text here... You can use Fish tags like [laughs], [sighs], etc.",
+                        placeholder="Enter text here... You can use tags like [laughter], [sigh], etc.",
                     )
                     vc_ref_audio = gr.Audio(
                         label="Reference Audio (3-10s recommended)",
@@ -1015,7 +464,7 @@ with gr.Blocks(title="Fish Speech S2 Pro Local") as demo:
                     vc_ref_text = gr.Textbox(
                         label="Reference Text (optional)",
                         lines=2,
-                        placeholder="Transcript of ref audio. Blank uses local Whisper only if FISH_LOCAL_ASR=1.",
+                        placeholder="Transcript of ref audio. Leave blank for auto-transcription.",
                     )
                     vc_lang = lang_dropdown()
                     vc_ns, vc_gs, vc_dn, vc_sp, vc_du, vc_pp, vc_po = gen_settings()
@@ -1114,3 +563,4 @@ demo.queue()
 # No prevent_thread_lock — launch() blocks here, keeping the cell alive.
 # share_url gets set by Gradio's tunnel thread within ~30s of blocking.
 demo.launch(share=True, debug=True, theme=gr.themes.Soft(), css=CSS)
+
