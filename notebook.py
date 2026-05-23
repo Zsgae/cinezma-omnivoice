@@ -452,6 +452,25 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
             # If any word is > 6 chars and the surface is short katakana, likely English
             if any(len(w) > 6 for w in r_words) and len(surface) <= 4:
                 # Fall back to direct hiragana-style reading via katakana map
+                # Full katakana → romaji table including digraphs and long vowel mark
+                # Process longest matches first (digraphs before single chars)
+                kana_map_digraph = {
+                    "キャ":"kya","キュ":"kyu","キョ":"kyo",
+                    "シャ":"sha","シュ":"shu","ショ":"sho",
+                    "チャ":"cha","チュ":"chu","チョ":"cho",
+                    "ニャ":"nya","ニュ":"nyu","ニョ":"nyo",
+                    "ヒャ":"hya","ヒュ":"hyu","ヒョ":"hyo",
+                    "ミャ":"mya","ミュ":"myu","ミョ":"myo",
+                    "リャ":"rya","リュ":"ryu","リョ":"ryo",
+                    "ギャ":"gya","ギュ":"gyu","ギョ":"gyo",
+                    "ジャ":"ja","ジュ":"ju","ジョ":"jo",
+                    "ビャ":"bya","ビュ":"byu","ビョ":"byo",
+                    "ピャ":"pya","ピュ":"pyu","ピョ":"pyo",
+                    "ファ":"fa","フィ":"fi","フェ":"fe","フォ":"fo",
+                    "ティ":"ti","ディ":"di","トゥ":"tu","ドゥ":"du",
+                    "ウィ":"wi","ウェ":"we","ウォ":"wo",
+                    "ヴァ":"va","ヴィ":"vi","ヴ":"vu","ヴェ":"ve","ヴォ":"vo",
+                }
                 kana_map = {
                     "ア":"a","イ":"i","ウ":"u","エ":"e","オ":"o",
                     "カ":"ka","キ":"ki","ク":"ku","ケ":"ke","コ":"ko",
@@ -462,14 +481,30 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
                     "マ":"ma","ミ":"mi","ム":"mu","メ":"me","モ":"mo",
                     "ヤ":"ya","ユ":"yu","ヨ":"yo",
                     "ラ":"ra","リ":"ri","ル":"ru","レ":"re","ロ":"ro",
-                    "ワ":"wa","ヲ":"wo","ン":"n","ー":"-",
+                    "ワ":"wa","ヲ":"wo","ン":"n",
                     "ガ":"ga","ギ":"gi","グ":"gu","ゲ":"ge","ゴ":"go",
                     "ザ":"za","ジ":"ji","ズ":"zu","ゼ":"ze","ゾ":"zo",
-                    "ダ":"da","ヂ":"di","ヅ":"du","デ":"de","ド":"do",
+                    "ダ":"da","デ":"de","ド":"do",
                     "バ":"ba","ビ":"bi","ブ":"bu","ベ":"be","ボ":"bo",
                     "パ":"pa","ピ":"pi","プ":"pu","ペ":"pe","ポ":"po",
+                    "ッ":"t",  # geminate — will be doubled by next consonant
                 }
-                r = "".join(kana_map.get(c, c) for c in surface)
+                # Build romaji by processing digraphs first, then singles
+                result_r = ""
+                i_k = 0
+                while i_k < len(surface):
+                    two = surface[i_k:i_k+2]
+                    if two in kana_map_digraph:
+                        result_r += kana_map_digraph[two]
+                        i_k += 2
+                    elif surface[i_k] == "ー":
+                        # Long vowel: repeat previous vowel
+                        result_r += result_r[-1] if result_r and result_r[-1] in "aeiou" else "o"
+                        i_k += 1
+                    else:
+                        result_r += kana_map.get(surface[i_k], surface[i_k])
+                        i_k += 1
+                r = result_r
         else:
             r = katsu.romaji(surface)
 
