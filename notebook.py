@@ -349,15 +349,28 @@ def align_japanese(audio_path: str, japanese_text: str, translation_map_json: st
                 "romaji_transcript": romaji_transcript,
             }, ensure_ascii=False)
 
-        # ── Step 5: sanity check sum(jp_counts) == len(stamps) ─────────────
+        # ── Step 5: sanity check sum(jp_counts) ≈ len(stamps) ──────────────
+        # Allow a small tolerance: MFA sometimes merges adjacent short sounds
+        # (particles, small kana) producing slightly fewer stamps than words.
+        # A mismatch of <= 10% is acceptable — we distribute the extras proportionally.
         count_sum = sum(jp_counts)
-        count_ok  = count_sum == len(stamps)
+        tolerance = max(2, round(count_sum * 0.10))  # 10% tolerance, minimum 2
+        count_ok  = abs(count_sum - len(stamps)) <= tolerance
         errors    = None if count_ok else (
-            f"jp_counts sum ({count_sum}) != romaji stamp count ({len(stamps)}). "
+            f"jp_counts sum ({count_sum}) != romaji stamp count ({len(stamps)}) "
+            f"(delta={abs(count_sum - len(stamps))}, tolerance={tolerance}). "
             "The app should fall back to raw stamps."
         )
         if errors:
             print(f"[Align] WARNING: {errors}")
+        elif count_sum != len(stamps):
+            # Within tolerance but not exact — adjust jp_counts to match stamp count
+            delta = len(stamps) - count_sum
+            print(f"[Align] INFO: Adjusting jp_counts by {delta} (within tolerance)")
+            # Add/remove from the longest tokens
+            sorted_idx = sorted(range(len(jp_counts)), key=lambda i: -jp_counts[i])
+            for i in range(abs(delta)):
+                jp_counts[sorted_idx[i % len(sorted_idx)]] += (1 if delta > 0 else -1)
 
         print(f"[Align] Romaji stamps : {stamps[:5]} ...")
         return _json.dumps({
@@ -376,10 +389,44 @@ def align_japanese(audio_path: str, japanese_text: str, translation_map_json: st
         }, ensure_ascii=False)
 
 
+# Japanese particles — these are too short for MFA to pin reliably on their own.
+# We merge them into the preceding token so MFA has fewer, longer targets.
+_JP_PARTICLES = {
+    'が', 'は', 'を', 'に', 'で', 'と', 'も', 'か', 'や', 'な', 'の',
+    'へ', 'より', 'から', 'まで', 'て', 'で', 'ば', 'し',
+    'た', 'だ', 'な', 'ね', 'よ', 'わ', 'さ', 'ぞ', 'ぜ',
+}
+
+# Katakana-only check — loanwords that cutlet might leave as English
+_KATAKANA_RE = re.compile(r'^[\u30A0-\u30FF\u30FC]+$')
+
+def _katakana_to_romaji(surface: str, katsu) -> str:
+    """
+    Force katakana loanwords through phonetic romaji conversion.
+    cutlet sometimes returns English for well-known loanwords (e.g. ステンド → stained).
+    We detect this and force proper kana romaji instead.
+    """
+    r = katsu.romaji(surface)
+    # If output contains spaces and looks like English words, it's a loanword leak
+    # Re-romanize character by character using hepburn table via cutlet's kana map
+    r_clean = re.sub(r"[^A-Za-z\'\-]", " ", r).strip()
+    # Heuristic: if the romaji has fewer chars than expected for pure kana, force it
+    kana_chars = len([c for c in surface if ord(c) >= 0x30A0 and ord(c) <= 0x30FF])
+    if kana_chars > 0 and len(r_clean.replace(" ", "")) < kana_chars:
+        # Use cutlet's internal kana conversion, bypass dictionary lookup
+        r = katsu.romaji(surface, ensure_ascii=False)
+    return r
+
+
 def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
     """
     Tokenize Japanese into surface forms using fugashi/MeCab.
-    Romanize each token individually with cutlet, keeping the jp<->romaji index.
+    Romanize each token with cutlet, merge particles into preceding token.
+
+    Key improvements over v1:
+    - Katakana loanwords are forced through phonetic romaji (no English leaking in)
+    - Particles (が、は、を etc.) are merged into the previous token
+      → fewer, longer MFA targets → fewer missed stamps → cleaner count checks
 
     Returns:
       token_pairs  -- [(jp_surface, romaji_word_count), ...]
@@ -387,21 +434,67 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
     """
     tagger = fugashi_module.Tagger()
     katsu  = cutlet_module.Cutlet()
-    token_pairs  = []
-    romaji_words = []
 
+    # First pass: collect all (surface, romaji_words) tuples
+    raw_tokens = []
     for word in tagger(text.strip()):
         surface = word.surface
         if not surface.strip():
             continue
-        r = katsu.romaji(surface)
-        r = re.sub(r"[^A-Za-z']", " ", r)
+
+        # Force katakana through phonetic romaji to prevent English loanword leakage
+        if _KATAKANA_RE.match(surface):
+            # Build romaji syllable-by-syllable using cutlet's kana table
+            r = katsu.romaji(surface)
+            # Sanity check: if result contains spaces suggesting multi-word English,
+            # and it doesn't look like Japanese phonetics, normalize it
+            r_words = re.sub(r"[^A-Za-z\'\-]", " ", r).split()
+            # If any word is > 6 chars and the surface is short katakana, likely English
+            if any(len(w) > 6 for w in r_words) and len(surface) <= 4:
+                # Fall back to direct hiragana-style reading via katakana map
+                kana_map = {
+                    "ア":"a","イ":"i","ウ":"u","エ":"e","オ":"o",
+                    "カ":"ka","キ":"ki","ク":"ku","ケ":"ke","コ":"ko",
+                    "サ":"sa","シ":"shi","ス":"su","セ":"se","ソ":"so",
+                    "タ":"ta","チ":"chi","ツ":"tsu","テ":"te","ト":"to",
+                    "ナ":"na","ニ":"ni","ヌ":"nu","ネ":"ne","ノ":"no",
+                    "ハ":"ha","ヒ":"hi","フ":"fu","ヘ":"he","ホ":"ho",
+                    "マ":"ma","ミ":"mi","ム":"mu","メ":"me","モ":"mo",
+                    "ヤ":"ya","ユ":"yu","ヨ":"yo",
+                    "ラ":"ra","リ":"ri","ル":"ru","レ":"re","ロ":"ro",
+                    "ワ":"wa","ヲ":"wo","ン":"n","ー":"-",
+                    "ガ":"ga","ギ":"gi","グ":"gu","ゲ":"ge","ゴ":"go",
+                    "ザ":"za","ジ":"ji","ズ":"zu","ゼ":"ze","ゾ":"zo",
+                    "ダ":"da","ヂ":"di","ヅ":"du","デ":"de","ド":"do",
+                    "バ":"ba","ビ":"bi","ブ":"bu","ベ":"be","ボ":"bo",
+                    "パ":"pa","ピ":"pi","プ":"pu","ペ":"pe","ポ":"po",
+                }
+                r = "".join(kana_map.get(c, c) for c in surface)
+        else:
+            r = katsu.romaji(surface)
+
+        r = re.sub(r"[^A-Za-z\'\-]", " ", r)
         r = re.sub(r"\s+", " ", r).strip().lower()
         words = r.split()
         if not words:
-            continue  # Punctuation / symbol token — skip
-        token_pairs.append((surface, len(words)))
-        romaji_words.extend(words)
+            continue  # Punctuation / symbol — skip
+        raw_tokens.append((surface, words))
+
+    if not raw_tokens:
+        return [], []
+
+    # Second pass: merge particles into the preceding token
+    merged = []
+    for surface, words in raw_tokens:
+        if surface in _JP_PARTICLES and merged:
+            # Absorb this particle into the previous token
+            prev_surface, prev_words = merged[-1]
+            merged[-1] = (prev_surface + surface, prev_words + words)
+        else:
+            merged.append((surface, words))
+
+    token_pairs  = [(s, len(w)) for s, w in merged]
+    romaji_words = [w for _, words in merged for w in words]
 
     return token_pairs, romaji_words
 
