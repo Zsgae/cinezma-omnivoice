@@ -50,6 +50,8 @@ import gradio as gr
 import requests
 import time
 
+SESSION_START_TIME = int(time.time() * 1000)  # ms timestamp, set once at boot
+
 RELAY_URL = "https://omnivoice-relay.zsage84869.workers.dev/register"
 
 CSS = """
@@ -671,7 +673,7 @@ def _register():
             print(f"[Relay] Got URL: {url}")
             for attempt in range(1, 4):
                 try:
-                    r = requests.post(RELAY_URL, json={"url": url}, timeout=15)
+                    r = requests.post(RELAY_URL, json={"url": url, "started_at": SESSION_START_TIME}, timeout=15)
                     if r.status_code == 200:
                         print(f"[Relay] ✓ Registered (attempt {attempt})")
                         return
