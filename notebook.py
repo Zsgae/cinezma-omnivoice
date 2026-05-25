@@ -24,6 +24,26 @@ logging.getLogger("omnivoice").setLevel(logging.INFO)
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 torch.backends.cuda.matmul.allow_tf32 = True
 
+# ── HF cache restore (Kaggle Dataset → local cache) ───────────────────────────
+# Mount your "cinezma-hf-cache" dataset in the notebook's Data tab.
+# This runs before any model load — if the dataset is present, weights are
+# copied into ~/.cache/huggingface so nothing gets re-downloaded this session.
+_CACHE_DATASET = "/kaggle/input/omnivoice-cache"
+_HF_CACHE      = os.path.expanduser("~/.cache/huggingface")
+
+if os.path.isdir(_CACHE_DATASET):
+    import shutil as _shutil
+    _cache_src = os.path.join(_CACHE_DATASET, ".cache", "huggingface")
+    if os.path.isdir(_cache_src):
+        print("[Cache] Restoring HF cache from dataset...", end=" ", flush=True)
+        _shutil.copytree(_cache_src, _HF_CACHE, dirs_exist_ok=True)
+        print("✓ Done — no downloads needed this session.")
+    else:
+        print("[Cache] ⚠ Found omnivoice-cache but no .cache/huggingface subfolder inside it.")
+else:
+    print("[Cache] ⚠ No cache dataset found at", _CACHE_DATASET)
+    print("[Cache]   Downloading from internet (slow). Add omnivoice-cache in the Data tab.")
+
 CHECKPOINT = "k2-fsa/OmniVoice"
 VOICES_DIR = "/kaggle/working/voice-assets/voices"
 
@@ -805,4 +825,3 @@ demo.queue()
 # No prevent_thread_lock — launch() blocks here, keeping the cell alive.
 # share_url gets set by Gradio's tunnel thread within ~30s of blocking.
 demo.launch(share=True, debug=True, theme=gr.themes.Soft(), css=CSS)
-
