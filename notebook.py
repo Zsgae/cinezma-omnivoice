@@ -539,17 +539,31 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
 
 
 with gr.Blocks(title="OmniVoice Demo") as demo:
-    # Creamy notification sound
+# Creamy notification sound (Synthesized)
     gr.HTML("""
     <script>
       function playCreamySound() {
-        const audio = new Audio('https://YOUR_LINK_HERE/creamy-sound.mp3'); // Replace with your direct URL
-        audio.volume = 0.5;
-        audio.play().catch(e => console.log("User hasn't interacted yet, waiting for click."));
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const oscillator = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+
+        // Creamy settings: Sine wave is soft, low frequency is warm
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(440, audioCtx.currentTime); // 440Hz is a standard A4 note
+        
+        // Smooth volume envelope (fade in/out)
+        gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
+        gainNode.gain.linearRampToValueAtTime(0.3, audioCtx.currentTime + 0.1); // Fade in
+        gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.8); // Smooth fade out
+
+        oscillator.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+
+        oscillator.start();
+        oscillator.stop(audioCtx.currentTime + 0.8);
       }
-      // Attempt to play on load (browsers often block this)
-      window.addEventListener('load', playCreamySound);
-      // Play on first user interaction to guarantee it works
+      
+      // Trigger on first click to bypass browser audio restrictions
       document.body.addEventListener('click', playCreamySound, { once: true });
     </script>
     """)
