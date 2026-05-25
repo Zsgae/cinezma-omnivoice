@@ -52,6 +52,9 @@ import time
 
 SESSION_START_TIME = int(time.time() * 1000)  # ms timestamp, set once at boot
 
+IDLE_TIMEOUT_SEC = 10 * 60  # 10 minutes — auto-kill if no generation request
+_last_activity_time = time.time()  # updated on every generate / align call
+
 RELAY_URL = "https://omnivoice-relay.zsage84869.workers.dev/register"
 
 CSS = """
@@ -130,6 +133,9 @@ def generate_speech(text, language, ref_audio, instruct,
                     num_step, guidance_scale, denoise,
                     speed, duration, preprocess_prompt, postprocess_output,
                     mode="clone", ref_text=None):
+    global _last_activity_time
+    _last_activity_time = time.time()  # reset idle timer on every generation
+
     if not text or not text.strip():
         return None, "Please enter some text."
 
@@ -255,6 +261,9 @@ def _detect_silences(data: np.ndarray, sr: int,
 
 
 def align_japanese(audio_path: str, japanese_text: str, translation_map_json: str = "") -> str:
+    global _last_activity_time
+    _last_activity_time = time.time()  # reset idle timer on every alignment call
+
     """
     CTC forced alignment — returns a JSON object with four keys cinEZma needs:
 
@@ -539,34 +548,6 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
 
 
 with gr.Blocks(title="OmniVoice Demo") as demo:
-# Creamy notification sound (Synthesized)
-    gr.HTML("""
-    <script>
-      function playCreamySound() {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const oscillator = audioCtx.createOscillator();
-        const gainNode = audioCtx.createGain();
-
-        // Creamy settings: Sine wave is soft, low frequency is warm
-        oscillator.type = 'sine';
-        oscillator.frequency.setValueAtTime(440, audioCtx.currentTime); // 440Hz is a standard A4 note
-        
-        // Smooth volume envelope (fade in/out)
-        gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
-        gainNode.gain.linearRampToValueAtTime(0.3, audioCtx.currentTime + 0.1); // Fade in
-        gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.8); // Smooth fade out
-
-        oscillator.connect(gainNode);
-        gainNode.connect(audioCtx.destination);
-
-        oscillator.start();
-        oscillator.stop(audioCtx.currentTime + 0.8);
-      }
-      
-      // Trigger on first click to bypass browser audio restrictions
-      document.body.addEventListener('click', playCreamySound, { once: true });
-    </script>
-    """)
     gr.HTML(BRAND_HTML)
 
     with gr.Tabs():
@@ -692,6 +673,33 @@ with gr.Blocks(title="OmniVoice Demo") as demo:
 # The watcher thread sees share_url appear, registers, and exits.
 import threading, time
 
+def _play_ready_chime():
+    """Fire a chime in the Kaggle browser tab — server is live."""
+    try:
+        from IPython.display import display, Javascript
+        display(Javascript("""
+        (function() {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            // C major arpeggio: C5 → E5 → G5 → C6
+            [523.25, 659.25, 783.99, 1046.50].forEach((freq, i) => {
+                const osc  = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.type = 'sine';
+                osc.frequency.value = freq;
+                const t = ctx.currentTime + i * 0.18;
+                gain.gain.setValueAtTime(0, t);
+                gain.gain.linearRampToValueAtTime(0.25, t + 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+                osc.start(t);
+                osc.stop(t + 0.5);
+            });
+        })();
+        """))
+    except Exception as e:
+        print(f"[Chime] Could not play sound: {e}")
+
 def _register():
     print("[Relay] Watching for share URL...")
     for _ in range(90):  # up to 3 min
@@ -704,6 +712,7 @@ def _register():
                     r = requests.post(RELAY_URL, json={"url": url, "started_at": SESSION_START_TIME}, timeout=15)
                     if r.status_code == 200:
                         print(f"[Relay] ✓ Registered (attempt {attempt})")
+                        _play_ready_chime()  # 🔔 server is up and relay is live
                         return
                     else:
                         print(f"[Relay] Attempt {attempt} HTTP {r.status_code}: {r.text}")
@@ -716,6 +725,81 @@ def _register():
     print("[Relay] ⚠ share_url never appeared after 3 min.")
 
 threading.Thread(target=_register, daemon=True).start()
+
+# ── Background cache warm-up ──────────────────────────────────────────────────
+# Runs concurrently with the live server — no waiting at startup.
+# Waits for share_url to confirm the server is actually accepting requests
+# before doing any heavy work (avoids race with model init).
+def _warm_cache():
+    print("[Cache] Waiting for server to come up before warming cache...")
+    for _ in range(90):
+        if getattr(demo, "share_url", None):
+            break
+        time.sleep(2)
+    else:
+        print("[Cache] ⚠ Server never came up — skipping cache warm.")
+        return
+
+    print("[Cache] Server is up. Starting background cache warm-up...")
+    try:
+        # ── Pre-load the MFA aligner model ───────────────────────────────────
+        # First align_japanese call is slow because it downloads MMS_FA weights.
+        # We trigger a no-op alignment here so the model is hot before real use.
+        global _ALIGNER_MODEL
+        if _ALIGNER_MODEL is None:
+            from ctc_forced_aligner import get_word_stamps
+            import tempfile, soundfile as sf
+            # Minimal 0.5s silent WAV at 16kHz — just enough to init the model
+            silent = np.zeros(int(_TARGET_SR * 0.5), dtype=np.float32)
+            with tempfile.TemporaryDirectory() as tmp:
+                wav = os.path.join(tmp, "warm.wav")
+                txt = os.path.join(tmp, "warm.txt")
+                sf.write(wav, silent, _TARGET_SR)
+                with open(txt, "w") as f:
+                    f.write("a")
+                try:
+                    result = get_word_stamps(wav, txt, model=None, model_type="MMS_FA")
+                    if isinstance(result, tuple) and len(result) > 1:
+                        _ALIGNER_MODEL = result[1]
+                        print("[Cache] ✓ MFA aligner model loaded and cached.")
+                except Exception as e:
+                    print(f"[Cache] MFA warm-up failed (non-fatal): {e}")
+
+        # ── Add more warm-up steps here as needed ────────────────────────────
+        # e.g. pre-load a voice clone prompt for the first preset character:
+        # chars = get_characters()
+        # if chars:
+        #     first_wav = next(iter(chars.values()))
+        #     model.create_voice_clone_prompt(ref_audio=first_wav, ref_text=None)
+        #     print("[Cache] ✓ Voice clone prompt pre-warmed.")
+
+        print("[Cache] ✓ Cache warm-up complete.")
+    except Exception as e:
+        print(f"[Cache] ⚠ Warm-up error (non-fatal): {e}")
+
+threading.Thread(target=_warm_cache, daemon=True).start()
+
+# ── Idle auto-kill ────────────────────────────────────────────────────────────
+IDLE_WARN_SEC = 8 * 60  # warn at 8 min, kill at 10 min
+
+def _idle_watcher():
+    warned = False
+    while True:
+        time.sleep(60)
+        idle = time.time() - _last_activity_time
+        remaining = IDLE_TIMEOUT_SEC - idle
+        if idle >= IDLE_TIMEOUT_SEC:
+            print(f"[IdleTimer] ⏹  No activity for {IDLE_TIMEOUT_SEC // 60} min — shutting down OmniVoice.")
+            demo.close()
+            os._exit(0)
+        elif idle >= IDLE_WARN_SEC and not warned:
+            warned = True
+            print(f"[IdleTimer] ⚠  Idle for {int(idle // 60)} min. "
+                  f"Auto-kill in ~{int(remaining // 60)} min if no requests arrive.")
+        elif idle < IDLE_WARN_SEC:
+            warned = False  # reset so warning fires again after activity resumes
+
+threading.Thread(target=_idle_watcher, daemon=True).start()
 
 demo.queue()
 # No prevent_thread_lock — launch() blocks here, keeping the cell alive.
