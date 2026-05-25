@@ -28,7 +28,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 # Mount your "cinezma-hf-cache" dataset in the notebook's Data tab.
 # This runs before any model load — if the dataset is present, weights are
 # copied into ~/.cache/huggingface so nothing gets re-downloaded this session.
-_CACHE_DATASET = "/kaggle/input/omnivoice-cache"
+_CACHE_DATASET = "/kaggle/input/datasets"
 _HF_CACHE      = os.path.expanduser("~/.cache/huggingface")
 
 if os.path.isdir(_CACHE_DATASET):
