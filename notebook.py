@@ -809,9 +809,9 @@ def _idle_watcher():
         idle = time.time() - _last_activity_time
         remaining = IDLE_TIMEOUT_SEC - idle
         if idle >= IDLE_TIMEOUT_SEC:
-            print(f"[IdleTimer] ⏹  No activity for {IDLE_TIMEOUT_SEC // 60} min — shutting down OmniVoice.")
+            print(f"[IdleTimer] ⏹  No activity for {IDLE_TIMEOUT_SEC // 60} min — closing Gradio server.")
             demo.close()
-            os._exit(0)
+            return
         elif idle >= IDLE_WARN_SEC and not warned:
             warned = True
             print(f"[IdleTimer] ⚠  Idle for {int(idle // 60)} min. "
