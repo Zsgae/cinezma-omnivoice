@@ -539,6 +539,20 @@ def _tokenize_with_index(text: str, cutlet_module, fugashi_module):
 
 
 with gr.Blocks(title="OmniVoice Demo") as demo:
+    # Creamy notification sound
+    gr.HTML("""
+    <script>
+      function playCreamySound() {
+        const audio = new Audio('https://YOUR_LINK_HERE/creamy-sound.mp3'); // Replace with your direct URL
+        audio.volume = 0.5;
+        audio.play().catch(e => console.log("User hasn't interacted yet, waiting for click."));
+      }
+      // Attempt to play on load (browsers often block this)
+      window.addEventListener('load', playCreamySound);
+      // Play on first user interaction to guarantee it works
+      document.body.addEventListener('click', playCreamySound, { once: true });
+    </script>
+    """)
     gr.HTML(BRAND_HTML)
 
     with gr.Tabs():
