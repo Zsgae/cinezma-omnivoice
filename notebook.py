@@ -28,18 +28,18 @@ torch.backends.cuda.matmul.allow_tf32 = True
 # Mount your "cinezma-hf-cache" dataset in the notebook's Data tab.
 # This runs before any model load — if the dataset is present, weights are
 # copied into ~/.cache/huggingface so nothing gets re-downloaded this session.
-_CACHE_DATASET = "/kaggle/input/datasets"
+_CACHE_DATASET = "/kaggle/input/datasets/ogzsage/omnivoice-cache"
 _HF_CACHE      = os.path.expanduser("~/.cache/huggingface")
 
 if os.path.isdir(_CACHE_DATASET):
     import shutil as _shutil
-    _cache_src = os.path.join(_CACHE_DATASET, ".cache", "huggingface")
+    _cache_src = os.path.join(_CACHE_DATASET, "hub")
     if os.path.isdir(_cache_src):
         print("[Cache] Restoring HF cache from dataset...", end=" ", flush=True)
-        _shutil.copytree(_cache_src, _HF_CACHE, dirs_exist_ok=True)
+        _shutil.copytree(_cache_src, os.path.join(_HF_CACHE, "hub"), dirs_exist_ok=True)
         print("✓ Done — no downloads needed this session.")
     else:
-        print("[Cache] ⚠ Found omnivoice-cache but no .cache/huggingface subfolder inside it.")
+        print("[Cache] ⚠ Found dataset but no hub subfolder inside it.")
 else:
     print("[Cache] ⚠ No cache dataset found at", _CACHE_DATASET)
     print("[Cache]   Downloading from internet (slow). Add omnivoice-cache in the Data tab.")
@@ -809,9 +809,9 @@ def _idle_watcher():
         idle = time.time() - _last_activity_time
         remaining = IDLE_TIMEOUT_SEC - idle
         if idle >= IDLE_TIMEOUT_SEC:
-            print(f"[IdleTimer] ⏹  No activity for {IDLE_TIMEOUT_SEC // 60} min — closing Gradio server.")
+            print(f"[IdleTimer] ⏹  No activity for {IDLE_TIMEOUT_SEC // 60} min — shutting down OmniVoice.")
             demo.close()
-            return
+            os._exit(0)
         elif idle >= IDLE_WARN_SEC and not warned:
             warned = True
             print(f"[IdleTimer] ⚠  Idle for {int(idle // 60)} min. "
