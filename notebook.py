@@ -136,6 +136,8 @@ def generate_speech(text, language, ref_audio, instruct,
     global _last_activity_time
     _last_activity_time = time.time()  # reset idle timer on every generation
 
+    global _last_request
+    _last_request = _time.time()
     if not text or not text.strip():
         return None, "Please enter some text."
 
@@ -725,6 +727,22 @@ def _register():
     print("[Relay] ⚠ share_url never appeared after 3 min.")
 
 threading.Thread(target=_register, daemon=True).start()
+
+import time as _time
+_last_request = _time.time()
+_IDLE_TIMEOUT = 600
+
+def _watchdog():
+    while True:
+        _time.sleep(30)
+        if _time.time() - _last_request > _IDLE_TIMEOUT:
+            print("[Watchdog] Idle — closing tunnel. Re-run cell 4 to reopen.")
+            demo.close()
+            return
+
+threading.Thread(target=_watchdog, daemon=True).start()
+
+demo.queue()
 
 # ── Background cache warm-up ──────────────────────────────────────────────────
 # Runs concurrently with the live server — no waiting at startup.
