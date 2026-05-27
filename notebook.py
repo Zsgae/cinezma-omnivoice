@@ -22,6 +22,10 @@ logging.basicConfig(
 logging.getLogger("omnivoice").setLevel(logging.INFO)
 
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+_CACHE_BACKUP = "/kaggle/working/hf-cache-backup"
+if os.path.exists(_CACHE_BACKUP):
+    os.environ["HF_HOME"] = _CACHE_BACKUP
+    print("[Cache] Found local backup — skipping HuggingFace download.")
 torch.backends.cuda.matmul.allow_tf32 = True
 
 CHECKPOINT = "k2-fsa/OmniVoice"
@@ -43,6 +47,16 @@ def get_characters():
 
 print(f"Model loaded. Sampling rate: {sampling_rate} Hz")
 print(f"Preset voices found: {len(get_characters())}")
+
+import shutil, threading as _threading
+def _backup_cache():
+    src = Path.home() / ".cache" / "huggingface"
+    dst = Path(_CACHE_BACKUP)
+    if src.exists() and not dst.exists():
+        print("[Cache] Backing up HF cache for fast restarts...")
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+        print("[Cache] ✓ Backup done.")
+_threading.Thread(target=_backup_cache, daemon=True).start()
 
 
 # ── Gradio UI + Relay ─────────────────────────────────────────────────────────
@@ -738,7 +752,8 @@ def _watchdog():
         if _time.time() - _last_request > _IDLE_TIMEOUT:
             print("[Watchdog] Idle — closing tunnel. Re-run cell 4 to reopen.")
             demo.close()
-            return
+            import os as _os
+            _os._exit(0)
 
 threading.Thread(target=_watchdog, daemon=True).start()
 
