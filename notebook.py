@@ -72,7 +72,7 @@ _threading.Thread(target=_backup_cache, daemon=True).start()
 _qwen_model     = None
 _qwen_tokenizer = None
 _qwen_loading   = False
-QWEN_CHECKPOINT = "Qwen/Qwen3-14B"
+QWEN_CHECKPOINT = "Qwen/Qwen3-4B"  # or "Qwen/Qwen3-1.7B" for even faster
 
 def _load_qwen():
     """Lazy-load Qwen3-14B in 4-bit. Called once on first WriterBot generate."""
