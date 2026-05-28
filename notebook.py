@@ -662,6 +662,41 @@ with gr.Blocks(title="OmniVoice Demo") as demo:
                 inputs=[vd_text, vd_lang, vd_ns, vd_gs, vd_dn, vd_sp, vd_du, vd_pp, vd_po] + vd_groups,
                 outputs=[vd_audio, vd_status],
             )
+        with gr.TabItem("✍️ WriterBot"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    wb_input = gr.Textbox(
+                        label="Your Prompt",
+                        lines=6,
+                        placeholder="Tell WriterBot what to write...",
+                    )
+                    wb_btn = gr.Button("Generate", variant="primary", size="lg")
+                    wb_clear = gr.Button("Clear", size="sm")
+                with gr.Column(scale=1):
+                    wb_output = gr.Textbox(label="WriterBot Output", lines=12)
+                    wb_status = gr.Textbox(label="Status", lines=1)
+
+            def writerbot_generate(prompt):
+                if not prompt or not prompt.strip():
+                    return "", "Please enter a prompt."
+                try:
+                    import google.generativeai as genai  # pip install google-generativeai
+                    # TODO: set your API key, e.g. via os.environ["GOOGLE_API_KEY"]
+                    genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
+                    model_wb = genai.GenerativeModel("gemma-4")  # swap model name as needed
+                    response = model_wb.generate_content(prompt.strip())
+                    return response.text, "Done."
+                except Exception as e:
+                    return "", f"Error: {type(e).__name__}: {e}"
+
+            wb_btn.click(
+                writerbot_generate,
+                inputs=[wb_input],
+                outputs=[wb_output, wb_status],
+                api_name="writerbot",
+            )
+            wb_clear.click(lambda: ("", "", ""), outputs=[wb_input, wb_output, wb_status])
+
         with gr.TabItem("MFA Align"):
             with gr.Row():
                 with gr.Column():
