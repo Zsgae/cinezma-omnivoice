@@ -980,7 +980,7 @@ with gr.Blocks(title="cinEZma — OmniVoice + WriterBot") as demo:
                         label="Rewritten Script",
                         lines=12,
                         placeholder="Your cinEZma-style rewrite will appear here...",
-                        show_copy_button=True,
+                        
                     )
                     wb_status = gr.Textbox(label="Status", lines=1)
 
