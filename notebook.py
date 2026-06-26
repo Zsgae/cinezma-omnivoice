@@ -29,7 +29,7 @@ if os.path.exists(_CACHE_BACKUP):
 torch.backends.cuda.matmul.allow_tf32 = True
 
 CHECKPOINT = "k2-fsa/OmniVoice"
-VOICES_DIR = "/kaggle/working/voice-assets/voices"
+VOICES_DIR = os.environ.get('OMNIVOICE_VOICE_DIR', '/kaggle/working/voice-assets')
 
 print(f"Loading model from {CHECKPOINT} ...")
 model = OmniVoice.from_pretrained(
