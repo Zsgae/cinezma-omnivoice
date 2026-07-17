@@ -41,6 +41,10 @@ model = OmniVoice.from_pretrained(
 )
 sampling_rate = model.sampling_rate
 
+# GPU facts for the worker-pool heartbeat (the launcher's guard already proved 2x T4).
+GPU_COUNT = torch.cuda.device_count() if torch.cuda.is_available() else 0
+GPU_TYPE = torch.cuda.get_device_name(0) if GPU_COUNT else "none"
+
 def get_characters():
     wavs = glob.glob(os.path.join(VOICES_DIR, "*.wav"))
     return {Path(w).stem: w for w in sorted(wavs)}
@@ -70,6 +74,31 @@ IDLE_TIMEOUT_SEC = 10 * 60  # 10 minutes — auto-kill if no generate or align r
 _last_activity_time = time.time()  # updated on every generate / align call
 
 RELAY_URL = "https://omnivoice-relay.zsage84869.workers.dev/register"
+
+# ── Worker identity (multi-GPU pool) ─────────────────────────────────────────
+# Injected at push-staging by the cinEZma server; a manual kaggle.com launch
+# falls back to an unattributed id — the pool treats it as one worker either way.
+WORKER_ID = os.environ.get("CINEZMA_WORKER_ID") or f"unattributed-{SESSION_START_TIME}"
+WORKER_ACCOUNT = os.environ.get("CINEZMA_ACCOUNT", "unknown")
+WORKER_QUOTA_H = float(os.environ.get("CINEZMA_QUOTA_H", "0") or 0)
+RELAY_BASE = RELAY_URL.rsplit("/register", 1)[0]
+HEARTBEAT_SEC = 30
+
+_WORKER_STATUS = "booting"   # booting -> idle -> busy (heartbeats only read this)
+_CURRENT_BATCH = None
+
+def _track_busy(fn):
+    # Flip busy/idle around every generation and alignment call so heartbeats
+    # report real occupancy. Deliberately does NOT touch _last_activity_time —
+    # that belongs to the idle watchdog and only real requests reset it.
+    def _wrapped(*args, **kwargs):
+        global _WORKER_STATUS
+        _WORKER_STATUS = "busy"
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _WORKER_STATUS = "idle"
+    return _wrapped
 
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
@@ -143,6 +172,7 @@ def refresh_characters():
     choices = list(chars.keys())
     return gr.update(choices=choices, value=choices[0] if choices else None)
 
+@_track_busy
 def generate_speech(text, language, ref_audio, instruct,
                     num_step, guidance_scale, denoise,
                     speed, duration, preprocess_prompt, postprocess_output,
@@ -274,6 +304,7 @@ def _detect_silences(data: np.ndarray, sr: int,
     return silences
 
 
+@_track_busy
 def align_japanese(audio_path: str, japanese_text: str, translation_map_json: str = "") -> str:
     global _last_activity_time
     _last_activity_time = time.time()  # reset idle timer on every alignment call
@@ -700,7 +731,7 @@ with gr.Blocks(title="OmniVoice Demo") as demo:
                     {"i": base + start + k, "t": t, "line": ln}
                     for k, (t, ln) in enumerate(chunk)
                 ]
-                return json.dumps({"next": base + len(buf), "entries": entries})
+                return json.dumps({"next": base + len(buf), "entries": entries, "worker": WORKER_ID, "account": WORKER_ACCOUNT})
 
             logs_since = gr.Textbox(label="Since index", value="0")
             logs_out   = gr.Textbox(label="Log JSON", lines=10)
@@ -747,28 +778,55 @@ def _play_ready_chime():
         print(f"[Chime] Could not play sound: {e}")
 
 def _register():
+    global _WORKER_STATUS
     print("[Relay] Watching for share URL...")
+    url = None
     for _ in range(90):  # up to 3 min
-        url = getattr(demo, "share_url", None)
-        if url and "gradio.live" in str(url):
-            url = str(url).strip()
+        candidate = getattr(demo, "share_url", None)
+        if candidate and "gradio.live" in str(candidate):
+            url = str(candidate).strip()
             print(f"[Relay] Got URL: {url}")
-            for attempt in range(1, 4):
-                try:
-                    r = requests.post(RELAY_URL, json={"url": url, "started_at": SESSION_START_TIME}, timeout=15)
-                    if r.status_code == 200:
-                        print(f"[Relay] ✓ Registered (attempt {attempt})")
-                        _play_ready_chime()  # 🔔 server is up and relay is live
-                        return
-                    else:
-                        print(f"[Relay] Attempt {attempt} HTTP {r.status_code}: {r.text}")
-                except Exception as e:
-                    print(f"[Relay] Attempt {attempt} error: {e}")
-                time.sleep(3)
-            print(f"[Relay] ⚠ Failed. Paste manually: {url}")
-            return
+            break
         time.sleep(2)
-    print("[Relay] ⚠ share_url never appeared after 3 min.")
+    if not url:
+        print("[Relay] ⚠ share_url never appeared after 3 min.")
+        return
+
+    # Register, then heartbeat forever: the same POST upserts this worker's
+    # pool record (keyed by WORKER_ID) every HEARTBEAT_SEC, carrying status,
+    # GPU facts, and a quota estimate. A legacy relay just overwrites its
+    # single pointer with the same url/started_at — harmless. This loop must
+    # NEVER touch _last_activity_time: heartbeats do not defeat the idle
+    # watchdog (self-termination is the pool's natural scale-down).
+    registered = False
+    while True:
+        try:
+            uptime_s = round(time.time() - SESSION_START_TIME / 1000, 1)
+            payload = {
+                "url": url,
+                "started_at": SESSION_START_TIME,
+                "workerId": WORKER_ID,
+                "account": WORKER_ACCOUNT,
+                "gpuType": GPU_TYPE,
+                "gpuCount": GPU_COUNT,
+                "status": _WORKER_STATUS,
+                "currentBatch": _CURRENT_BATCH,
+                "uptime": uptime_s,
+                "remainingQuota": round(max(0.0, WORKER_QUOTA_H - uptime_s / 3600), 2) if WORKER_QUOTA_H else None,
+            }
+            r = requests.post(RELAY_URL, json=payload, timeout=15)
+            if r.status_code == 200 and not registered:
+                registered = True
+                if _WORKER_STATUS == "booting":
+                    _WORKER_STATUS = "idle"
+                print(f"[Relay] ✓ Registered as {WORKER_ID} ({WORKER_ACCOUNT})")
+                _play_ready_chime()  # 🔔 server is up and relay is live
+            elif r.status_code != 200 and not registered:
+                print(f"[Relay] register HTTP {r.status_code}: {r.text[:120]}")
+        except Exception as e:
+            if not registered:
+                print(f"[Relay] register error: {e}")
+        time.sleep(HEARTBEAT_SEC)
 
 threading.Thread(target=_register, daemon=True).start()
 
@@ -838,6 +896,11 @@ def _idle_watcher():
         remaining = IDLE_TIMEOUT_SEC - idle
         if idle >= IDLE_TIMEOUT_SEC:
             print(f"[IdleTimer] ⏹  No activity for {IDLE_TIMEOUT_SEC // 60} min — shutting down OmniVoice.")
+            try:
+                requests.delete(f"{RELAY_BASE}/workers/{WORKER_ID}", timeout=5)
+                print("[Relay] Deregistered from pool.")
+            except Exception:
+                pass
             demo.close()
             os._exit(0)
         elif idle >= IDLE_WARN_SEC and not warned:
