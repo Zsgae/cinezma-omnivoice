@@ -66,7 +66,7 @@ import time
 
 SESSION_START_TIME = int(time.time() * 1000)  # ms timestamp, set once at boot
 
-IDLE_TIMEOUT_SEC = 10 * 60  # 10 minutes — auto-kill if no generation request
+IDLE_TIMEOUT_SEC = 10 * 60  # 10 minutes — auto-kill if no generate or align request
 _last_activity_time = time.time()  # updated on every generate / align call
 
 RELAY_URL = "https://omnivoice-relay.zsage84869.workers.dev/register"
@@ -150,8 +150,6 @@ def generate_speech(text, language, ref_audio, instruct,
     global _last_activity_time
     _last_activity_time = time.time()  # reset idle timer on every generation
 
-    global _last_request
-    _last_request = _time.time()
     if not text or not text.strip():
         return None, "Please enter some text."
 
@@ -741,21 +739,6 @@ def _register():
     print("[Relay] ⚠ share_url never appeared after 3 min.")
 
 threading.Thread(target=_register, daemon=True).start()
-
-import time as _time
-_last_request = _time.time()
-_IDLE_TIMEOUT = 600
-
-def _watchdog():
-    while True:
-        _time.sleep(30)
-        if _time.time() - _last_request > _IDLE_TIMEOUT:
-            print("[Watchdog] Idle — closing tunnel. Re-run cell 4 to reopen.")
-            demo.close()
-            import os as _os
-            _os._exit(0)
-
-threading.Thread(target=_watchdog, daemon=True).start()
 
 demo.queue()
 
