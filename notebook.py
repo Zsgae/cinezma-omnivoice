@@ -680,6 +680,38 @@ with gr.Blocks(title="OmniVoice Demo") as demo:
                 api_name="align_japanese",
             )
 
+        with gr.TabItem("Logs"):
+            # cinEZma terminal mirror. The launcher's tee cell captures every
+            # stdout/stderr line (with timestamps) into builtins._CINEZMA_LOG;
+            # this endpoint serves cursor-based increments so the app streams
+            # the whole lifecycle — boot, GPU guard, model load, generation —
+            # into its own terminal live. Cheap to call; safe to poll.
+            def get_logs(since: str = "0") -> str:
+                import builtins, json
+                buf  = getattr(builtins, "_CINEZMA_LOG", [])
+                base = getattr(builtins, "_CINEZMA_LOG_BASE", 0)
+                try:
+                    s = int(float(since or "0"))
+                except Exception:
+                    s = 0
+                start = max(0, s - base)
+                chunk = buf[start:start + 400]
+                entries = [
+                    {"i": base + start + k, "t": t, "line": ln}
+                    for k, (t, ln) in enumerate(chunk)
+                ]
+                return json.dumps({"next": base + len(buf), "entries": entries})
+
+            logs_since = gr.Textbox(label="Since index", value="0")
+            logs_out   = gr.Textbox(label="Log JSON", lines=10)
+            logs_btn   = gr.Button("Fetch Logs")
+            logs_btn.click(
+                get_logs,
+                inputs=[logs_since],
+                outputs=[logs_out],
+                api_name="get_logs",
+            )
+
 # ── Launch Gradio + relay registration ───────────────────────────────────────
 # Key insight: demo.share_url IS set while server runs (confirmed).
 # We start a watcher thread first, then call launch() WITHOUT
