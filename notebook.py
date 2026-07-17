@@ -45,6 +45,22 @@ sampling_rate = model.sampling_rate
 GPU_COUNT = torch.cuda.device_count() if torch.cuda.is_available() else 0
 GPU_TYPE = torch.cuda.get_device_name(0) if GPU_COUNT else "none"
 
+def _gpu_vram():
+    # Device-wide VRAM per GPU (driver numbers, so other processes count too).
+    if not GPU_COUNT:
+        return None
+    try:
+        out = []
+        for i in range(GPU_COUNT):
+            free_b, total_b = torch.cuda.mem_get_info(i)
+            out.append({
+                "usedGB": round((total_b - free_b) / 2**30, 1),
+                "totalGB": round(total_b / 2**30, 1),
+            })
+        return out
+    except Exception:
+        return None
+
 def get_characters():
     wavs = glob.glob(os.path.join(VOICES_DIR, "*.wav"))
     return {Path(w).stem: w for w in sorted(wavs)}
@@ -809,6 +825,7 @@ def _register():
                 "account": WORKER_ACCOUNT,
                 "gpuType": GPU_TYPE,
                 "gpuCount": GPU_COUNT,
+                "vram": _gpu_vram(),
                 "status": _WORKER_STATUS,
                 "currentBatch": _CURRENT_BATCH,
                 "uptime": uptime_s,
