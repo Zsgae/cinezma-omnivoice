@@ -103,18 +103,29 @@ HEARTBEAT_SEC = 30
 _WORKER_STATUS = "booting"   # booting -> idle -> busy (heartbeats only read this)
 _CURRENT_BATCH = None
 
+import functools
+
 def _track_busy(fn):
     # Flip busy/idle around every generation and alignment call so heartbeats
     # report real occupancy. Deliberately does NOT touch _last_activity_time —
     # that belongs to the idle watchdog and only real requests reset it.
-    def _wrapped(*args, **kwargs):
-        global _WORKER_STATUS
-        _WORKER_STATUS = "busy"
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            _WORKER_STATUS = "idle"
-    return _wrapped
+    #
+    # @functools.wraps is LOAD-BEARING: gradio introspects the function
+    # signature to build the API schema for signature-derived endpoints
+    # (align_japanese). A bare *args wrapper erases the parameter names, the
+    # schema degrades to param_0/param_1/..., and every named-payload predict
+    # fails with "No value provided for required parameter: param_0".
+    def _decorate(f):
+        @functools.wraps(f)
+        def _wrapped(*args, **kwargs):
+            global _WORKER_STATUS
+            _WORKER_STATUS = "busy"
+            try:
+                return f(*args, **kwargs)
+            finally:
+                _WORKER_STATUS = "idle"
+        return _wrapped
+    return _decorate(fn)
 
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
