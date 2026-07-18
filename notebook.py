@@ -86,8 +86,16 @@ import time
 
 SESSION_START_TIME = int(time.time() * 1000)  # ms timestamp, set once at boot
 
-IDLE_TIMEOUT_SEC = 10 * 60  # 10 minutes — auto-kill if no generate or align request
-_last_activity_time = time.time()  # updated on every generate / align call
+# ── Worker lifecycle: BOOTING -> READY -> IDLE -> BUSY -> DRAINING -> STOPPED ──
+# BOOTING/LOADING = model load + waiting for share_url + relay registration.
+# READY = the moment registration's first heartbeat succeeds (in _register()) —
+# that is also where the idle clock starts. IDLE/BUSY are _WORKER_STATUS as
+# before. DRAINING is a server-side sticky flag the relay overlays on top of
+# whatever status we heartbeat (see relay-worker/worker.js) — nothing to do
+# here. STOPPED = deregistration (DELETE below) followed by process exit.
+IDLE_TIMEOUT_SEC = 10 * 60   # minutes of no activity AFTER READY — auto-kill
+BOOT_TIMEOUT_SEC = 15 * 60   # hard cap if the worker never reaches READY at all
+_last_activity_time = None  # None while BOOTING/LOADING; set once in _register()
 
 RELAY_URL = "https://omnivoice-relay.zsage84869.workers.dev/register"
 
@@ -805,7 +813,7 @@ def _play_ready_chime():
         print(f"[Chime] Could not play sound: {e}")
 
 def _register():
-    global _WORKER_STATUS
+    global _WORKER_STATUS, _last_activity_time
     print("[Relay] Watching for share URL...")
     url = None
     for _ in range(90):  # up to 3 min
@@ -847,6 +855,11 @@ def _register():
                 registered = True
                 if _WORKER_STATUS == "booting":
                     _WORKER_STATUS = "idle"
+                if _last_activity_time is None:
+                    # READY: registration's first heartbeat just succeeded —
+                    # this is when the idle clock is allowed to start, not
+                    # whenever the process happened to import.
+                    _last_activity_time = time.time()
                 print(f"[Relay] ✓ Registered as {WORKER_ID} ({WORKER_ACCOUNT})")
                 _play_ready_chime()  # 🔔 server is up and relay is live
             elif r.status_code != 200 and not registered:
@@ -920,6 +933,21 @@ def _idle_watcher():
     warned = False
     while True:
         time.sleep(60)
+        if _last_activity_time is None:
+            # Still BOOTING/LOADING — registration hasn't completed (READY
+            # never happened), so the idle clock has not started. The idle
+            # watchdog must never kill a worker in this state; only a
+            # generous hard cap applies, in case boot is truly stuck.
+            boot_elapsed = time.time() - SESSION_START_TIME / 1000
+            if boot_elapsed >= BOOT_TIMEOUT_SEC:
+                print(f"[IdleTimer] ⏹  Never reached READY after {BOOT_TIMEOUT_SEC // 60} min "
+                      f"(stuck booting/registering) — shutting down.")
+                try:
+                    requests.delete(f"{RELAY_BASE}/workers/{WORKER_ID}", timeout=5)
+                except Exception:
+                    pass
+                os._exit(0)
+            continue
         idle = time.time() - _last_activity_time
         remaining = IDLE_TIMEOUT_SEC - idle
         if idle >= IDLE_TIMEOUT_SEC:
