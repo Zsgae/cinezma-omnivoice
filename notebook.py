@@ -851,6 +851,26 @@ def _register():
                 "remainingQuota": round(max(0.0, WORKER_QUOTA_H - uptime_s / 3600), 2) if WORKER_QUOTA_H else None,
             }
             r = requests.post(RELAY_URL, json=payload, timeout=15)
+
+            # ── KILL CHANNEL ────────────────────────────────────────────────
+            # Kaggle's public API cannot stop a running kernel, so the only true
+            # teardown is the session ending itself. cinEZma sets a `terminate`
+            # flag on the relay; it rides back on this heartbeat's response and
+            # we exit here. The container dies with the process — models and
+            # dependencies are gone, and the next launch is a full reinstall.
+            # That is the intended, irreversible behaviour of the kill button.
+            if r.status_code == 200:
+                try:
+                    if r.json().get("terminate") is True:
+                        print("[Relay] ⚠ TERMINATE received — shutting the environment down now.", flush=True)
+                        try:
+                            requests.delete(f"{RELAY_BASE}/workers/{WORKER_ID}", timeout=5)
+                        except Exception:
+                            pass  # the relay sweeps stale records anyway
+                        os._exit(0)   # hard exit: no atexit, no Gradio drain, no resurrection
+                except ValueError:
+                    pass              # non-JSON body: nothing to act on
+
             if r.status_code == 200 and not registered:
                 registered = True
                 if _WORKER_STATUS == "booting":
